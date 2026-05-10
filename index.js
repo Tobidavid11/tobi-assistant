@@ -3,6 +3,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
+const ws = require('ws');
 const express = require('express');
 const cors = require('cors');
 const app = express();
@@ -33,7 +34,9 @@ app.post('/command', async (req, res) => {
 app.listen(3001, () => console.log('🌐 Dashboard API running on port 3001'));
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { transport: ws }
+});
 
 const MAX_SYSTEM_PROMPT = `
 You are Max, the personal assistant of Tobiloba David (Tobi), a 19-year-old freelance product and brand designer based in Nigeria.
