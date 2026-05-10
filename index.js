@@ -459,7 +459,7 @@ process.on('SIGINT', async () => {
   await client.destroy();
   process.exit(0);
 });
+setTimeout(() => {
+  client.initialize();
+}, 5000);
 
-client.initialize();
-
-client.initialize();
