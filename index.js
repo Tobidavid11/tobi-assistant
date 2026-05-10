@@ -222,6 +222,18 @@ client.on('ready', () => {
   console.log('✅ Max is live and ready to work!');
 });
 
+client.on('authenticated', () => {
+  console.log('🔐 Max authenticated successfully!');
+});
+
+client.on('auth_failure', (msg) => {
+  console.error('❌ Auth failure:', msg);
+});
+
+client.on('disconnected', (reason) => {
+  console.log('🔌 Max disconnected:', reason);
+});
+
 async function handleCommand(msg, command) {
   try {
     const parsed = await groq.chat.completions.create({
