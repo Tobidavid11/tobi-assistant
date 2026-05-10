@@ -315,6 +315,7 @@ Return only the WhatsApp message, nothing else.`
 }
 
 client.on('message', async (msg) => {
+  console.log(`📨 Message received from: ${msg.from}`);
   const fromMain = msg.from === process.env.YOUR_MAIN_NUMBER;
   const fromBot = msg.fromMe;
 
