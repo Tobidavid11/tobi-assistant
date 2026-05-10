@@ -34,6 +34,26 @@ app.post('/command', async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.get('/health', (req, res) => res.send('Max is alive!'));
 app.listen(PORT, () => console.log(`🌐 Dashboard API running on port ${PORT}`));
+let latestQR = null;
+
+
+// Serve QR as a webpage
+app.get('/qr', async (req, res) => {
+  if (!latestQR) {
+    return res.send('<h2>No QR code yet. Refresh in a few seconds...</h2>');
+  }
+  const QRCode = require('qrcode');
+  const qrImage = await QRCode.toDataURL(latestQR);
+  res.send(`
+    <html>
+      <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#0a0a0a;color:white;font-family:sans-serif;">
+        <h2>Scan with your second WhatsApp number</h2>
+        <img src="${qrImage}" style="width:300px;height:300px;" />
+        <p>Refresh this page if QR expires</p>
+      </body>
+    </html>
+  `);
+});
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
