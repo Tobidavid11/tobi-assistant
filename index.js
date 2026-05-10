@@ -173,8 +173,9 @@ async function getHistory(chatId) {
 
 // --- WHATSAPP CLIENT ---
 const client = new Client({
-authStrategy: new (require('whatsapp-web.js').NoAuth)(),
-puppeteer: {
+  authStrategy: new (require('whatsapp-web.js').NoAuth)(),
+  puppeteer: {
+    executablePath: '/usr/bin/chromium',
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -182,11 +183,11 @@ puppeteer: {
       '--disable-accelerated-2d-canvas',
       '--no-first-run',
       '--no-zygote',
+      '--single-process',
       '--disable-gpu'
     ]
   }
 });
-
 client.on('qr', (qr) => {
   console.log('📱 Scan this QR with your SECOND WhatsApp number:');
   qrcode.generate(qr, { small: true });
