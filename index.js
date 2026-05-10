@@ -31,7 +31,9 @@ app.post('/command', async (req, res) => {
   }
 });
 
-app.listen(3001, () => console.log('🌐 Dashboard API running on port 3001'));
+const PORT = process.env.PORT || 3001;
+app.get('/health', (req, res) => res.send('Max is alive!'));
+app.listen(PORT, () => console.log(`🌐 Dashboard API running on port ${PORT}`));
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
