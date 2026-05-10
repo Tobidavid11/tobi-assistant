@@ -195,8 +195,10 @@ async function getHistory(chatId) {
 
 // --- WHATSAPP CLIENT ---
 const client = new Client({
-  authStrategy: new (require('whatsapp-web.js').NoAuth)(),
-puppeteer: {
+  authStrategy: new LocalAuth({
+    dataPath: '/tmp/whatsapp-session'
+  }),
+  puppeteer: {
     headless: true,
     executablePath: '/usr/bin/chromium',
     args: [
