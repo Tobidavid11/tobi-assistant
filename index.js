@@ -334,33 +334,73 @@ async function connectToWhatsApp() {
       if (isFromMain) {
         console.log(`📩 Command from Tobi: ${text}`);
 
-        const isJustChatting = !text.toLowerCase().includes('message ') &&
-          !text.toLowerCase().includes('send ') &&
-          !text.toLowerCase().includes('follow up') &&
-          !text.toLowerCase().includes('reach out');
+// Ask Groq to decide what type of request this is
+      const intentCheck = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an intent classifier for a WhatsApp PA bot.
+Classify the user's message into one of these intents and respond ONLY with the intent word:
+- "command" → they want to message/reach out/send something to someone else
+- "chat" → they are chatting, updating, venting, or asking Max something conversational
+- "creative" → they want Max to write something (status post, caption, draft, message template, content)
 
-        if (isJustChatting) {
-          const response = await groq.chat.completions.create({
-            model: 'llama-3.3-70b-versatile',
-            messages: [
-              {
-                role: 'system',
-                content: `${MAX_SYSTEM_PROMPT}
-Tobi is texting you directly right now. You are his PA.
-Chat with him naturally — ask how things are going, give heads up on anything relevant, be proactive.
-If he just says "hey" or "hi", greet him warmly and check in on him.
-Keep it brief and natural — this is WhatsApp.
-Return only your reply, nothing else.`
-              },
-              { role: 'user', content: text }
-            ]
-          });
-          const reply = response.choices[0].message.content.trim();
-          await sock.sendMessage(chatId, { text: reply });
-          return;
-        }
+Examples:
+"Message John about the project" → command
+"Hey max" → chat  
+"Going well, logo approved" → chat
+"Come up with a WhatsApp status post" → creative
+"Write me a caption for my portfolio" → creative
+"How are you" → chat
+"Send Chidera my Calendly link" → command`
+          },
+          { role: 'user', content: text }
+        ]
+      });
 
+      const intent = intentCheck.choices[0].message.content.trim().toLowerCase();
+      console.log(`🎯 Intent: ${intent}`);
+
+      if (intent === 'command') {
         await handleCommand(msgObj, text);
+        return;
+      }
+
+      // For both chat and creative — use conversation history
+      const tobiHistory = await getHistory(`tobi-${chatId}`);
+      const historyMessages = tobiHistory.slice(-10).map(m => ({ role: m.role, content: m.content }));
+
+      const systemPrompt = intent === 'creative'
+        ? `${MAX_SYSTEM_PROMPT}
+Tobi is asking you to create content for him. Write exactly what he asked for — no explanations, no preamble.
+If he wants a WhatsApp status, write a clean status post.
+If he wants a caption, write the caption.
+If he wants a draft, write the draft.
+Just deliver the content directly.`
+        : `${MAX_SYSTEM_PROMPT}
+Tobi is texting you directly. You are his PA having an ongoing conversation.
+Remember what he's already told you in this conversation and don't repeat questions.
+Be natural, brief, and genuinely helpful.
+Don't keep asking about the same thing he already answered.
+Return only your reply, nothing else.`;
+
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...historyMessages,
+          { role: 'user', content: text }
+        ]
+      });
+
+      const reply = response.choices[0].message.content.trim();
+
+      // Save tobi's direct conversation history
+      await saveMessage(`tobi-${chatId}`, 'user', text);
+      await saveMessage(`tobi-${chatId}`, 'assistant', reply);
+
+      await sock.sendMessage(chatId, { text: reply });
         return;
       }
 
