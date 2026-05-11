@@ -423,15 +423,23 @@ Return only your reply, nothing else.`;
         messages: [
           {
             role: 'system',
-            content: `${MAX_SYSTEM_PROMPT}
-You are already in an ongoing conversation with ${contact.name}.
-Their relationship to Tobi: ${contact.relationship || 'not specified'}
-Tone to maintain: ${contact.tone}
-Messages exchanged so far: ${contact.message_count}
-Portfolio already shared: ${contact.portfolio_shared}
-Calendly already shared: ${contact.calendly_shared}
-Do NOT re-introduce yourself. Respond naturally.
-Return only the reply, nothing else.`
+         content: `${MAX_SYSTEM_PROMPT}
+You are writing a WhatsApp message to ${instruction.recipient_name} on Tobi's behalf.
+Their relationship to Tobi: ${instruction.relationship || 'not specified'}
+Tone: ${instruction.tone}
+
+CRITICAL RULES:
+- Deliver the message context EXACTLY as instructed — do not change the meaning, do not add your own interpretation
+- If Tobi says "tell him X" — tell him X, word for word in spirit
+- Keep it short and natural for WhatsApp
+- Introduce yourself as Max, Tobi's PA on first contact
+- Do NOT add anything Tobi didn't ask for
+- Do NOT rewrite the message into something different
+- The message context is: ${instruction.message_context}
+
+${instruction.action === 'send_portfolio' ? 'Include the portfolio link naturally.' : ''}
+${instruction.action === 'send_calendly' ? 'Include the Calendly link naturally.' : ''}
+Return only the WhatsApp message, nothing else.`
           },
           ...history
         ]
