@@ -315,21 +315,23 @@ async function connectToWhatsApp() {
       if (msg.key.fromMe) continue;
 
       const chatId = msg.key.remoteJid;
+      const senderJid = msg.key.participant || msg.key.remoteJid; // Get sender in group or direct
+      const isGroup = chatId.includes('@g.us');
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
       if (!text || text.trim() === '') continue;
 
-      console.log(`📨 Message from ${chatId}: ${text}`);
+      console.log(`📨 Message from ${senderJid} in ${isGroup ? 'group' : 'direct'}: ${text}`);
 
       const mainNumber = process.env.YOUR_MAIN_NUMBER.replace('@s.whatsapp.net', '').replace('@lid', '');
-      const fromNumber = chatId.replace('@s.whatsapp.net', '').replace('@lid', '');
-      const isFromMain = fromNumber.includes(mainNumber) || mainNumber.includes(fromNumber);
+      const senderNumber = senderJid.replace('@s.whatsapp.net', '').replace('@lid', '');
+      const isFromMain = senderNumber.includes(mainNumber) || mainNumber.includes(senderNumber);
 
       const replyFn = async (replyText) => {
         await sock.sendMessage(chatId, { text: replyText });
       };
 
-      const msgObj = { from: chatId, body: text, reply: replyFn };
+      const msgObj = { from: senderJid, body: text, reply: replyFn };
 
       if (isFromMain) {
         console.log(`📩 Command from Tobi: ${text}`);
@@ -363,8 +365,17 @@ Examples:
       console.log(`🎯 Intent: ${intent}`);
 
       if (intent === 'command') {
-        await handleCommand(msgObj, text);
-        return;
+        // For commands, check if we have the contact stored first
+        const existingContact = await getContact(chatId);
+        if (existingContact) {
+          // User is messaging an existing contact, treat this as a natural conversation instead
+          // So we can respond with context from stored info
+          console.log(`📌 Message to known contact ${existingContact.name}, handling as conversation`);
+          intent = 'chat'; // Treat known contacts as chat, not command
+        } else {
+          await handleCommand(msgObj, text);
+          return;
+        }
       }
 
       // For both chat and creative — use conversation history
@@ -417,28 +428,37 @@ Return only your reply, nothing else.`;
       await supabase.from('contacts').update({ message_count: currentCount + 1 }).eq('chat_id', chatId);
 
       const history = await getHistory(chatId);
+      
+      // Check if this is first contact or established
+      const isFirstReply = currentCount === 0;
 
       const response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
         messages: [
           {
             role: 'system',
-         content: `${MAX_SYSTEM_PROMPT}
-You are writing a WhatsApp message to ${instruction.recipient_name} on Tobi's behalf.
-Their relationship to Tobi: ${instruction.relationship || 'not specified'}
-Tone: ${instruction.tone}
+            content: `${MAX_SYSTEM_PROMPT}
 
-CRITICAL RULES:
-- Deliver the message context EXACTLY as instructed — do not change the meaning, do not add your own interpretation
-- If Tobi says "tell him X" — tell him X, word for word in spirit
-- Keep it short and natural for WhatsApp
-- Introduce yourself as Max, Tobi's PA on first contact
-- Do NOT add anything Tobi didn't ask for
-- Do NOT rewrite the message into something different
-- The message context is: ${instruction.message_context}
+${contact.name} from Tobi's contacts just messaged Max.
+Contact Details:
+- Name: ${contact.name}
+- Relationship: ${contact.relationship || 'not specified'}
+- Tone to use: ${contact.tone || 'friendly'}
+- First contact/reply: ${isFirstReply}
+- Message count: ${currentCount}
 
-${instruction.action === 'send_portfolio' ? 'Include the portfolio link naturally.' : ''}
-${instruction.action === 'send_calendly' ? 'Include the Calendly link naturally.' : ''}
+INSTRUCTIONS FOR REPLYING:
+- This is a REPLY to their message, not an outreach
+- Keep it natural, brief, and conversational
+- Match the tone they set while maintaining Tobi's personality
+- Do NOT introduce yourself as "I'm Max, Tobi's PA" unless they don't know yet
+- If they're a known contact with established relationship: be warm and natural
+- If this is first time they message: brief intro is fine, but match their energy
+- NEVER be robotic or overly formal — this is WhatsApp, be real
+- Use conversation history to understand context and avoid repeating info
+- If they ask a direct question, answer it directly without extra fluff
+- Keep it short — 1-2 sentences usually better than paragraphs
+
 Return only the WhatsApp message, nothing else.`
           },
           ...history
@@ -454,10 +474,16 @@ Return only the WhatsApp message, nothing else.`
       await sock.sendMessage(chatId, { text: reply });
       console.log(`✅ Max replied to ${contact.name}: ${reply}`);
 
-      const contactName = contact.name !== 'Someone' ? contact.name : chatId;
-      await sock.sendMessage(process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`, {
-        text: `🔔 *Max Update*\n\n*${contactName} said:* ${text}\n\n*Max replied:* ${reply}`
-      });
+      // Send notification to Tobi about the conversation
+      const contactName = contact.name !== 'Someone' ? contact.name : senderNumber;
+      const mainJid = process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`;
+      try {
+        await sock.sendMessage(mainJid, {
+          text: `🔔 *Max Update*\n\n*${contactName} said:* ${text}\n\n*Max replied:* ${reply}`
+        });
+      } catch (err) {
+        console.error('Failed to notify Tobi:', err.message);
+      }
     }
   });
 }
