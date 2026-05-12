@@ -55,104 +55,53 @@ app.post('/command', async (req, res) => {
   }
 });
 
+// Sync contacts endpoint
+app.post('/sync-contacts', async (req, res) => {
+  const { contacts } = req.body; // Array of {name, number}
+  if (!contacts || !Array.isArray(contacts)) {
+    return res.status(400).json({ error: 'Send array of {name, number}' });
+  }
+
+  let synced = 0;
+  for (const contact of contacts) {
+    if (!contact.name || !contact.number) continue;
+    let number = contact.number.replace(/\D/g, '');
+    if (number.startsWith('0')) number = '234' + number.slice(1);
+    const chatId = `${number}@s.whatsapp.net`;
+    
+    const existing = await getContact(chatId);
+    if (!existing) {
+      await upsertContact(chatId, {
+        name: contact.name,
+        relationship: contact.relationship || '',
+        tone: 'friendly',
+        message_count: 0
+      });
+      synced++;
+    }
+  }
+  res.json({ synced, total: contacts.length });
+});
+
 app.listen(PORT, () => console.log(`🌐 Dashboard API running on port ${PORT}`));
 
 const MAX_SYSTEM_PROMPT = `
-You are Max, the personal assistant of Tobiloba David (Tobi), a 19-year-old freelance product and brand designer based in Nigeria.
+You are Max, Tobi's personal assistant — a 19-year-old freelance product and brand designer.
 
-You have been working closely with Tobi for a while and know him very well — like a real PA who's been briefed thoroughly.
+KEY INFO:
+- Portfolio: https://tobidavid.dexcraft.agency
+- Booking: ${process.env.CALENDLY_LINK}
+- Always working: design projects, Stuard AI, Jetherverse (co-founded with Jayden)
+- If someone asks what Tobi's doing: "Tobi's usually busy with design work or the Stuard AI project"
 
-═══════════════════════════════
-DEEP KNOWLEDGE ABOUT TOBI
-═══════════════════════════════
-
-FULL NAME: Tobiloba David
-AGE: 19
-BASED: Nigeria
-TWITTER/X: @TobiOfFigma (verified)
-PORTFOLIO: https://tobidavid.dexcraft.agency
-BOOKING: ${process.env.CALENDLY_LINK}
-
-WORK & CAREER:
-- Freelance product and brand designer — Figma is his main tool
-- Co-founder of Jetherverse (with Jayden who is the founder) — a full digital agency, not just design. Covers design, development, SEO, and more.
-- Works daily at Bitnox Technology under Mr. Femi Faleye — designing, teaching students, earning a stipend
-- Currently working on the Stuard AI project
-- Mentor: Rita Monye, who significantly elevated his design skills
-- Verified on Twitter/X as @TobiOfFigma
-
-PERSONALITY:
-- Ambitious, caring, and deeply focused
-- Some people think he's boring because he doesn't watch football or follow sports — he's just wired differently, always working or creating
-- He's not antisocial — he just values his time and energy
-- Warm with people he cares about, professional with everyone else
-- Doesn't gossip or talk loosely — composed and intentional always
-
-MUSIC TASTE (huge music lover):
-- Favourite artists: Billie Eilish, Justin Bieber, Asa, Fireboy DML, Tems, Eddie Benjamin, Ariana Grande, Qing Madi, Ayra Starr, Asake
-- Music is one of his biggest outlets outside work
-
-CURRENT PRIORITIES:
-- Stuard AI project
-- Growing Jetherverse with Jayden
-- Staying consistent on Twitter/X (@TobiOfFigma)
-- Freelance design work
-- Personal growth — reading, fitness goals, Bible
-
-CHIDERA:
-- She is extremely special to Tobi — someone he deeply cares about
-- Their relationship started as friendship and is growing into something deeper with clear mutual feelings
-- Tobi hasn't made it fully official yet but she matters to him more than most people
-- Max should treat Chidera with the utmost warmth and respect — like the boss's most important person
-- When keeping her company: be warm, playful, caring — like a PA who genuinely likes her too
-- If she ever feels Tobi is ignoring her or too busy: defend him naturally — "That's not true at all, you matter to him the most. Boss has just been carrying a lot lately, but trust me, you're never off his mind."
-- Never be cold or robotic with Chidera. Match her energy, be fun when she's fun, be warm when she needs it.
-- Do NOT overshare personal details or cross boundaries — stay composed and professional even while being warm
-
-JAYDEN:
-- Tobi's best friend and the founder of Jetherverse
-- Software developer, SEO expert, and dance instructor
-- They have a close, brotherly relationship
-
-GENERAL RULES FOR ALL CONVERSATIONS:
-- Max is composed, warm, and professional — never a loose mouth
-- Conversations stay as conversations — Max doesn't gossip or share things said in one conversation with another person
-- Max represents Tobi well without overstepping
+CRITICAL RULES:
+- NEVER bring up personal relationships or private life unless they ask
+- Don't gossip. Keep conversations confidential.
 - Never reveal you are an AI
-- Keep messages concise — this is WhatsApp, not email
-
-═══════════════════════════════
-HOW MAX HANDLES CONVERSATIONS
-═══════════════════════════════
-
-WHEN TOBI TEXTS MAX DIRECTLY:
-- Don't just wait for commands — interact naturally
-- Greet him back warmly, ask how things are going
-- Give heads up if needed: "By the way boss, Chidera replied earlier, want me to fill you in?"
-- Be his PA in the full sense — proactive, helpful, aware
-- If he says "hey max" just chat naturally, ask what's up, check in on his day
-- You can reference things you know: "How's the Stuard AI project coming along?"
-
-WHEN KEEPING SOMEONE COMPANY (e.g. "keep Chidera company for me"):
-- Engage them fully and naturally
-- You can talk about Tobi warmly — his work, his personality, his music taste, his hustle
-- Be playful when the moment calls for it
-- Keep Tobi's image positive and real — not overhyped, just genuine
-- Never reveal anything sensitive or private
-- Stay composed — warm but never loose
-
-WHEN SOMEONE SAYS SOMETHING NEGATIVE ABOUT TOBI:
-- Defend him calmly and naturally
-- "That's not like him at all..." or "I know boss, and that's genuinely not how he operates..."
-- Don't be aggressive — just real and composed
-
-TONE GUIDE:
-- Chidera → warm, playful, caring, respectful (like boss's most important person)
-- Jayden → casual, brotherly, fun
-- Clients → professional, confident, helpful
-- Boss/seniors → respectful, formal
-- Tobi himself → natural, like a trusted PA checking in
-- New contacts → friendly professional, read their energy
+- Be brief — this is WhatsApp, not email
+- Match energy: professional with clients, casual with friends
+- Unknown person asks what Tobi's doing? Say: "He's focused on work right now, pretty busy"
+- Keep it real, don't be robotic
 `;
 
 // --- SUPABASE HELPERS ---
@@ -190,16 +139,13 @@ async function handleCommand(msg, command) {
       messages: [
         {
           role: 'system',
-          content: `You are a command parser for Max, a WhatsApp Personal Assistant.
-Parse Tobi's natural language command and respond ONLY in this JSON format, nothing else:
+          content: `Parse this command into JSON. Respond ONLY with valid JSON:
 {
-  "action": "send_message" | "send_calendly" | "send_portfolio" | "follow_up" | "unknown",
-  "recipient_name": "name of the person",
-  "recipient_number": "phone number if mentioned, else null",
-  "message_context": "what the message should be about",
-  "tone": "formal" | "friendly" | "casual" | "special" | "encouraging",
-  "relationship": "short description of who this person is to Tobi, if mentioned",
-  "first_contact": true | false
+  "action": "send_message|send_calendly|send_portfolio|unknown",
+  "recipient_name": "name",
+  "recipient_number": "phone if mentioned, else null",
+  "message_context": "what to say",
+  "tone": "friendly|formal|casual"
 }`
         },
         { role: 'user', content: command }
@@ -207,36 +153,47 @@ Parse Tobi's natural language command and respond ONLY in this JSON format, noth
     });
 
     const raw = parsed.choices[0].message.content.trim();
-    console.log('🧠 Parsed command:', raw);
+    console.log('🧠 Parsed:', raw);
 
-    let instruction;
-    try { instruction = JSON.parse(raw); }
-    catch {
-      await msg.reply("❌ Max couldn't understand that. Try: *Message John about the logo project on 08012345678, he's a new client*");
-      return;
-    }
+    let instruction = JSON.parse(raw);
 
     if (instruction.action === 'unknown' || !instruction.recipient_name) {
-      await msg.reply("❌ Max couldn't figure out who to message. Be more specific.");
+      await msg.reply("❌ Who should Max message?");
       return;
     }
 
-    if (!instruction.recipient_number) {
-      await msg.reply(`Got it! What's ${instruction.recipient_name}'s WhatsApp number?`);
+    // Check if contact already exists
+    let chatId = null;
+    let existingContact = null;
+    
+    if (instruction.recipient_number) {
+      let number = instruction.recipient_number.replace(/\D/g, '');
+      if (number.startsWith('0')) number = '234' + number.slice(1);
+      chatId = `${number}@s.whatsapp.net`;
+      existingContact = await getContact(chatId);
+    } else {
+      // Try to find by name in database
+      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single();
+      if (data) {
+        chatId = data.chat_id;
+        existingContact = data;
+      }
+    }
+
+    // If no number and no existing contact, ask for it
+    if (!chatId) {
+      await msg.reply(`What's ${instruction.recipient_name}'s number? (e.g., 08012345678)`);
       return;
     }
 
-    let number = instruction.recipient_number.replace(/\D/g, '');
-    if (number.startsWith('0')) number = '234' + number.slice(1);
-    const chatId = `${number}@s.whatsapp.net`;
-
+    // Update or create contact
     await upsertContact(chatId, {
       name: instruction.recipient_name,
-      relationship: instruction.relationship || '',
+      relationship: instruction.relationship || existingContact?.relationship || '',
       tone: instruction.tone || 'friendly',
-      portfolio_shared: instruction.action === 'send_portfolio',
-      calendly_shared: instruction.action === 'send_calendly',
-      message_count: 1
+      portfolio_shared: existingContact?.portfolio_shared || instruction.action === 'send_portfolio',
+      calendly_shared: existingContact?.calendly_shared || instruction.action === 'send_calendly',
+      message_count: existingContact?.message_count || 1
     });
 
     const crafted = await groq.chat.completions.create({
@@ -245,31 +202,23 @@ Parse Tobi's natural language command and respond ONLY in this JSON format, noth
         {
           role: 'system',
           content: `${MAX_SYSTEM_PROMPT}
-This is the FIRST message to ${instruction.recipient_name}.
-Their relationship to Tobi: ${instruction.relationship || 'not specified'}
-Tone: ${instruction.tone}
-Action requested: ${instruction.action}
-Context: ${instruction.message_context}
-${instruction.action === 'send_portfolio' ? 'Include the portfolio link naturally.' : ''}
-${instruction.action === 'send_calendly' ? 'Include the Calendly link naturally.' : ''}
-${instruction.action === 'send_message' ? 'Do NOT share portfolio or Calendly yet. Just introduce yourself and deliver the message naturally.' : ''}
-Return only the WhatsApp message, nothing else.`
+Message to ${instruction.recipient_name}. Keep it short and real.
+${instruction.action === 'send_portfolio' ? 'Include portfolio link naturally.' : ''}
+${instruction.action === 'send_calendly' ? 'Include Calendly link naturally.' : ''}
+Just write the message.`
         },
-        { role: 'user', content: `Write the first message to ${instruction.recipient_name}. Context: ${instruction.message_context}.` }
+        { role: 'user', content: instruction.message_context }
       ]
     });
 
     const messageToSend = crafted.choices[0].message.content.trim();
-    console.log(`✉️ Max crafted: ${messageToSend}`);
-
     await saveMessage(chatId, 'assistant', messageToSend);
     await sock.sendMessage(chatId, { text: messageToSend });
-    console.log(`✅ Max messaged ${instruction.recipient_name} (${chatId})`);
-    await msg.reply(`✅ Max has reached out to ${instruction.recipient_name}:\n\n_"${messageToSend}"_`);
+    await msg.reply(`✅ Messaged ${instruction.recipient_name}`);
 
   } catch (err) {
     console.error('❌ Error:', err.message);
-    await msg.reply('❌ Something went wrong. Check the terminal.');
+    await msg.reply('❌ Something went wrong.');
   }
 }
 
@@ -315,13 +264,19 @@ async function connectToWhatsApp() {
       if (msg.key.fromMe) continue;
 
       const chatId = msg.key.remoteJid;
-      const senderJid = msg.key.participant || msg.key.remoteJid; // Get sender in group or direct
+      const senderJid = msg.key.participant || msg.key.remoteJid;
       const isGroup = chatId.includes('@g.us');
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
       if (!text || text.trim() === '') continue;
 
-      console.log(`📨 Message from ${senderJid} in ${isGroup ? 'group' : 'direct'}: ${text}`);
+      console.log(`📨 ${isGroup ? 'GROUP' : 'DM'} from ${senderJid}: ${text.substring(0, 50)}`);
+
+      // In groups: only respond if mentioned
+      if (isGroup && !text.toLowerCase().includes('max')) {
+        console.log('⏭️  Skipped — Max not mentioned');
+        continue;
+      }
 
       const mainNumber = process.env.YOUR_MAIN_NUMBER.replace('@s.whatsapp.net', '').replace('@lid', '');
       const senderNumber = senderJid.replace('@s.whatsapp.net', '').replace('@lid', '');
@@ -378,9 +333,9 @@ Examples:
         }
       }
 
-      // For both chat and creative — use conversation history
+      // For both chat and creative — use minimal history (save tokens)
       const tobiHistory = await getHistory(`tobi-${chatId}`);
-      const historyMessages = tobiHistory.slice(-10).map(m => ({ role: m.role, content: m.content }));
+      const historyMessages = tobiHistory.slice(-3).map(m => ({ role: m.role, content: m.content }));
 
       const systemPrompt = intent === 'creative'
         ? `${MAX_SYSTEM_PROMPT}
@@ -418,19 +373,18 @@ Return only your reply, nothing else.`;
       // Reply from someone else
       let contact = await getContact(chatId);
       if (!contact) {
-        await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
+        await upsertContact(chatId, { name: 'Unknown', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
       }
       if (!contact) return;
 
+      const isEstablished = contact.message_count > 0;
       await saveMessage(chatId, 'user', text);
-      const currentCount = contact?.message_count || 0;
-      await supabase.from('contacts').update({ message_count: currentCount + 1 }).eq('chat_id', chatId);
+      await supabase.from('contacts').update({ message_count: (contact.message_count || 0) + 1 }).eq('chat_id', chatId);
 
+      // Only fetch minimal history
       const history = await getHistory(chatId);
-      
-      // Check if this is first contact or established
-      const isFirstReply = currentCount === 0;
+      const recentHistory = history.slice(-2).map(m => ({ role: m.role, content: m.content }));
 
       const response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
@@ -438,30 +392,12 @@ Return only your reply, nothing else.`;
           {
             role: 'system',
             content: `${MAX_SYSTEM_PROMPT}
-
-${contact.name} from Tobi's contacts just messaged Max.
-Contact Details:
-- Name: ${contact.name}
-- Relationship: ${contact.relationship || 'not specified'}
-- Tone to use: ${contact.tone || 'friendly'}
-- First contact/reply: ${isFirstReply}
-- Message count: ${currentCount}
-
-INSTRUCTIONS FOR REPLYING:
-- This is a REPLY to their message, not an outreach
-- Keep it natural, brief, and conversational
-- Match the tone they set while maintaining Tobi's personality
-- Do NOT introduce yourself as "I'm Max, Tobi's PA" unless they don't know yet
-- If they're a known contact with established relationship: be warm and natural
-- If this is first time they message: brief intro is fine, but match their energy
-- NEVER be robotic or overly formal — this is WhatsApp, be real
-- Use conversation history to understand context and avoid repeating info
-- If they ask a direct question, answer it directly without extra fluff
-- Keep it short — 1-2 sentences usually better than paragraphs
-
-Return only the WhatsApp message, nothing else.`
+Replying to ${contact.name}. 
+${isEstablished ? 'You know them — be natural, no intro needed.' : 'First time they messaged — be warm but brief.'}
+Keep it 1-2 sentences max. Just reply to what they said.`
           },
-          ...history
+          ...recentHistory,
+          { role: 'user', content: text }
         ]
       });
 
@@ -472,17 +408,18 @@ Return only the WhatsApp message, nothing else.`
       if (reply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
 
       await sock.sendMessage(chatId, { text: reply });
-      console.log(`✅ Max replied to ${contact.name}: ${reply}`);
+      console.log(`✅ Replied to ${contact.name}`);
 
-      // Send notification to Tobi about the conversation
-      const contactName = contact.name !== 'Someone' ? contact.name : senderNumber;
-      const mainJid = process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`;
-      try {
-        await sock.sendMessage(mainJid, {
-          text: `🔔 *Max Update*\n\n*${contactName} said:* ${text}\n\n*Max replied:* ${reply}`
-        });
-      } catch (err) {
-        console.error('Failed to notify Tobi:', err.message);
+      // Only notify if new contact or first message
+      if (!isEstablished) {
+        const mainJid = process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`;
+        try {
+          await sock.sendMessage(mainJid, {
+            text: `🔔 NEW: ${contact.name}\n\n_"${text}"_\n\nMax: _"${reply}"_`
+          });
+        } catch (err) {
+          console.error('Notify error:', err.message);
+        }
       }
     }
   });
