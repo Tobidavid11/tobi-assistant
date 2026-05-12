@@ -283,9 +283,12 @@ async function connectToWhatsApp() {
         continue;
       }
 
-      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace('@s.whatsapp.net', '').replace('@lid', '');
-      const senderNumber = senderJid.replace('@s.whatsapp.net', '').replace('@lid', '');
-      const isFromMain = senderNumber.includes(mainNumber) || mainNumber.includes(senderNumber);
+      // Clean up numbers for comparison
+      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/@s\.whatsapp\.net/g, '').replace(/@lid/g, '').replace(/\D/g, '');
+      const senderNumber = senderJid.replace(/@s\.whatsapp\.net/g, '').replace(/@lid/g, '').replace(/\D/g, '');
+      
+      // Direct comparison of just the digits
+      const isFromMain = mainNumber === senderNumber;
 
       const replyFn = async (replyText) => {
         await sock.sendMessage(chatId, { text: replyText });
@@ -294,15 +297,15 @@ async function connectToWhatsApp() {
       const msgObj = { from: senderJid, body: text, reply: replyFn };
 
       if (isFromMain) {
-        console.log(`📩 Command from Tobi: ${text}`);
+        console.log(`✅ Message from TOBI: ${text.substring(0, 50)}`);
 
-// Ask Groq to decide what type of request this is
-      const intentCheck = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          {
-            role: 'system',
-            content: `You are an intent classifier for a WhatsApp PA bot.
+        // Ask Groq to decide what type of request this is
+        const intentCheck = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            {
+              role: 'system',
+              content: `You are an intent classifier for a WhatsApp PA bot.
 Classify the user's message into one of these intents and respond ONLY with the intent word:
 - "command" → they want to message/reach out/send something to someone else
 - "chat" → they are chatting, updating, venting, or asking Max something conversational
@@ -316,40 +319,33 @@ Examples:
 "Write me a caption for my portfolio" → creative
 "How are you" → chat
 "Send Chidera my Calendly link" → command`
-          },
-          { role: 'user', content: text }
-        ]
-      });
+            },
+            { role: 'user', content: text }
+          ]
+        });
 
-      const intent = intentCheck.choices[0].message.content.trim().toLowerCase();
-      console.log(`🎯 Intent: ${intent}`);
+        let intent = intentCheck.choices[0].message.content.trim().toLowerCase();
+        console.log(`🎯 Intent: ${intent}`);
 
-      if (intent === 'command') {
-        // For commands, check if we have the contact stored first
-        const existingContact = await getContact(chatId);
-        if (existingContact) {
-          // User is messaging an existing contact, treat this as a natural conversation instead
-          // So we can respond with context from stored info
-          console.log(`📌 Message to known contact ${existingContact.name}, handling as conversation`);
-          intent = 'chat'; // Treat known contacts as chat, not command
-        } else {
+        if (intent === 'command') {
+          console.log(`📤 Processing as command`);
           await handleCommand(msgObj, text);
-          return;
+          continue; // Move to next message
         }
-      }
 
-      // For both chat and creative — use minimal history (save tokens)
-      const tobiHistory = await getHistory(`tobi-${chatId}`);
-      const historyMessages = tobiHistory.slice(-3).map(m => ({ role: m.role, content: m.content }));
+        // Handle chat/creative for Tobi
+        // Use minimal history (save tokens)
+        const tobiHistory = await getHistory(`tobi-${chatId}`);
+        const historyMessages = tobiHistory.slice(-3).map(m => ({ role: m.role, content: m.content }));
 
-      const systemPrompt = intent === 'creative'
-        ? `${MAX_SYSTEM_PROMPT}
+        const systemPrompt = intent === 'creative'
+          ? `${MAX_SYSTEM_PROMPT}
 Tobi is asking you to create content for him. Write exactly what he asked for — no explanations, no preamble.
 If he wants a WhatsApp status, write a clean status post.
 If he wants a caption, write the caption.
 If he wants a draft, write the draft.
 Just deliver the content directly.`
-        : `${MAX_SYSTEM_PROMPT}
+          : `${MAX_SYSTEM_PROMPT}
 Tobi is texting you directly. You are his PA having an ongoing conversation.
 CRITICAL: Never repeat the same response twice — always vary how you answer.
 Remember what he's already told you in this conversation and don't repeat questions.
@@ -358,23 +354,24 @@ Don't keep asking about the same thing he already answered.
 Never use canned phrases — respond naturally to what he actually said.
 Return only your reply, nothing else.`;
 
-      const response = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...historyMessages,
-          { role: 'user', content: text }
-        ]
-      });
+        const response = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...historyMessages,
+            { role: 'user', content: text }
+          ]
+        });
 
-      const reply = response.choices[0].message.content.trim();
+        const reply = response.choices[0].message.content.trim();
 
-      // Save tobi's direct conversation history
-      await saveMessage(`tobi-${chatId}`, 'user', text);
-      await saveMessage(`tobi-${chatId}`, 'assistant', reply);
+        // Save tobi's direct conversation history
+        await saveMessage(`tobi-${chatId}`, 'user', text);
+        await saveMessage(`tobi-${chatId}`, 'assistant', reply);
 
-      await sock.sendMessage(chatId, { text: reply });
-        return;
+        await sock.sendMessage(chatId, { text: reply });
+        console.log(`💬 Replied to Tobi: ${reply.substring(0, 40)}...`);
+        continue; // Move to next message
       }
 
       // Reply from someone else
