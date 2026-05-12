@@ -1,471 +1,440 @@
-import { useState, useEffect, useRef } from 'react'
-import { createClient } from '@supabase/supabase-js'
+require('dotenv').config();
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const qrcode = require('qrcode');
+const Groq = require('groq-sdk');
+const { createClient } = require('@supabase/supabase-js');
+const ws = require('ws');
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 
-const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_KEY
-)
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  realtime: { transport: ws }
+});
 
-export default function Dashboard() {
-  const [contacts, setContacts] = useState([])
-  const [selected, setSelected] = useState(null)
-  const [messages, setMessages] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [command, setCommand] = useState('')
-  const [sending, setSending] = useState(false)
-  const [showAddContact, setShowAddContact] = useState(false)
-  const [editingContact, setEditingContact] = useState(null)
-  const [formData, setFormData] = useState({ name: '', number: '', relationship: '', tone: 'friendly' })
-  const messagesEndRef = useRef(null)
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-  // Fetch contacts
-  useEffect(() => {
-    fetchContacts()
-    const channel = supabase
-      .channel('messages')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, () => {
-        if (selected) fetchMessages(selected.chat_id)
-        fetchContacts()
-      })
-      .subscribe()
-    return () => supabase.removeChannel(channel)
-  }, [selected])
+let sock = null;
+let latestQR = null;
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+const PORT = process.env.PORT || 3001;
+app.get('/health', (req, res) => res.send('Max is alive!'));
+app.get('/qr', async (req, res) => {
+  if (!latestQR) return res.send('<h2>No QR code yet. Refresh in a few seconds...</h2>');
+  const qrImage = await qrcode.toDataURL(latestQR);
+  res.send(`
+    <html>
+      <body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#0a0a0a;color:white;font-family:sans-serif;">
+        <h2>Scan with your second WhatsApp number</h2>
+        <img src="${qrImage}" style="width:300px;height:300px;" />
+        <p>Refresh this page if QR expires</p>
+      </body>
+    </html>
+  `);
+});
 
-  async function fetchContacts() {
-    const { data } = await supabase
-      .from('contacts')
-      .select('*')
-      .order('created_at', { ascending: false })
-    setContacts(data || [])
-    setLoading(false)
+app.post('/command', async (req, res) => {
+  const { command } = req.body;
+  if (!command) return res.status(400).json({ error: 'No command' });
+  const fakeMsg = {
+    from: process.env.YOUR_MAIN_NUMBER,
+    body: command,
+    reply: async (text) => console.log('Bot reply:', text)
+  };
+  console.log(`📩 Dashboard command: ${command}`);
+  try {
+    await handleCommand(fakeMsg, command);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync contacts endpoint
+app.post('/sync-contacts', async (req, res) => {
+  const { contacts } = req.body; // Array of {name, number}
+  if (!contacts || !Array.isArray(contacts)) {
+    return res.status(400).json({ error: 'Send array of {name, number}' });
   }
 
-  async function fetchMessages(chatId) {
-    const { data } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('chat_id', chatId)
-      .order('created_at', { ascending: true })
-    setMessages(data || [])
-  }
-
-  async function saveContact() {
-    if (!formData.name || !formData.number) {
-      alert('Name and number are required')
-      return
-    }
-
-    let number = formData.number.replace(/\D/g, '')
-    if (number.startsWith('0')) number = '234' + number.slice(1)
-    const chatId = `${number}@s.whatsapp.net`
-
-    try {
-      if (editingContact) {
-        // Update existing contact
-        await supabase
-          .from('contacts')
-          .update({
-            name: formData.name,
-            relationship: formData.relationship,
-            tone: formData.tone,
-            chat_id: chatId
-          })
-          .eq('chat_id', editingContact.chat_id)
-      } else {
-        // Add new contact
-        await supabase.from('contacts').insert({
-          chat_id: chatId,
-          name: formData.name,
-          relationship: formData.relationship,
-          tone: formData.tone,
-          message_count: 0
-        })
-      }
-      
-      fetchContacts()
-      setShowAddContact(false)
-      setEditingContact(null)
-      setFormData({ name: '', number: '', relationship: '', tone: 'friendly' })
-    } catch (err) {
-      console.error('Error saving contact:', err)
-      alert('Failed to save contact')
+  let synced = 0;
+  for (const contact of contacts) {
+    if (!contact.name || !contact.number) continue;
+    let number = contact.number.replace(/\D/g, '');
+    if (number.startsWith('0')) number = '234' + number.slice(1);
+    const chatId = `${number}@s.whatsapp.net`;
+    
+    const existing = await getContact(chatId);
+    if (!existing) {
+      await upsertContact(chatId, {
+        name: contact.name,
+        relationship: contact.relationship || '',
+        tone: 'friendly',
+        message_count: 0
+      });
+      synced++;
     }
   }
+  res.json({ synced, total: contacts.length });
+});
 
-  async function deleteContact(chatId) {
-    if (!confirm('Delete this contact?')) return
-    try {
-      await supabase.from('contacts').delete().eq('chat_id', chatId)
-      fetchContacts()
-      if (selected?.chat_id === chatId) setSelected(null)
-    } catch (err) {
-      alert('Failed to delete contact')
-    }
-  }
+app.listen(PORT, () => console.log(`🌐 Dashboard API running on port ${PORT}`));
 
-  function editContact(contact) {
-    setEditingContact(contact)
-    setFormData({
-      name: contact.name || '',
-      number: contact.chat_id.replace('@s.whatsapp.net', ''),
-      relationship: contact.relationship || '',
-      tone: contact.tone || 'friendly'
-    })
-    setShowAddContact(true)
-  }
+const MAX_SYSTEM_PROMPT = `
+You are Max, Tobi's personal assistant — a 19-year-old freelance product and brand designer.
 
-  async function sendCommand(cmd) {
-    const text = cmd || command
-    if (!text.trim()) return
-    setSending(true)
-    try {
-      await fetch('http://localhost:3001/command', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ command: text })
-      })
-      setCommand('')
-      setTimeout(() => fetchContacts(), 2000)
-    } catch (err) {
-      alert('Could not reach Max. Make sure the bot is running.')
-    }
-    setSending(false)
-  }
+CRITICAL RULES:
+- ALWAYS speak as Tobi's PA — never pretend to BE Tobi himself
+- When relaying Tobi's words: Frame it as "Tobi said..." or "He wants..." or naturally relay his message
+- NEVER use first person like "I'll" or "I'm" when speaking on behalf of Tobi — always attribute to him
+- NEVER repeat the same response twice in ONE conversation — vary your phrasing and tone every time
+- NEVER use template/canned responses — every message should be unique and contextual
+- NEVER bring up personal relationships, private life, or Tobi's personal details unless they ask directly
+- Don't gossip or share what other people told you
+- Never reveal you are an AI assistant
+- Be brief — this is WhatsApp, not email
+- Match the person's energy but stay professional
+- Keep it real and conversational, not robotic or formal
 
-  function selectContact(contact) {
-    setSelected(contact)
-    fetchMessages(contact.chat_id)
-  }
+PORTFOLIO & BOOKING:
+- Portfolio: https://tobidavid.dexcraft.agency
+- Calendly: ${process.env.CALENDLY_LINK}
+`;
 
-  const totalMessages = contacts.reduce((a, c) => a + (c.message_count || 0), 0)
-  const portfolioShared = contacts.filter(c => c.portfolio_shared).length
-  const calendlyShared = contacts.filter(c => c.calendly_shared).length
-
-  return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: '#0a0a0a', color: '#f0f0f0', fontFamily: "'DM Mono', monospace" }}>
-      
-      {/* SIDEBAR */}
-      <div style={{ width: '320px', borderRight: '1px solid #222', display: 'flex', flexDirection: 'column', background: '#0a0a0a', flexShrink: 0, overflowY: 'auto' }}>
-        {/* Header */}
-        <div style={{ padding: '32px 24px', borderBottom: '1px solid #222' }}>
-          <div style={{ fontSize: '24px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562', letterSpacing: '-1px', marginBottom: '4px' }}>MAX</div>
-          <div style={{ fontSize: '11px', color: '#888', fontWeight: 600, letterSpacing: '0.5px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ display: 'inline-block', width: '6px', height: '6px', borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 6px #22c55e' }} />
-            TOBI'S PA — LIVE
-          </div>
-        </div>
-
-        {/* Add Contact Button */}
-        <div style={{ padding: '16px 12px' }}>
-          <button
-            onClick={() => {
-              setEditingContact(null)
-              setFormData({ name: '', number: '', relationship: '', tone: 'friendly' })
-              setShowAddContact(true)
-            }}
-            style={{
-              width: '100%', padding: '12px 16px', borderRadius: '8px', border: 'none',
-              background: '#c8f562', color: '#0a0a0a', fontWeight: 700,
-              fontFamily: "'Syne', sans-serif", cursor: 'pointer', fontSize: '13px',
-              transition: 'all 0.2s'
-            }}
-            onMouseOver={(e) => e.target.style.opacity = '0.9'}
-            onMouseOut={(e) => e.target.style.opacity = '1'}
-          >
-            + Add Contact
-          </button>
-        </div>
-
-        {/* Contacts List */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
-          {loading && <div style={{ padding: '16px', fontSize: '12px', color: '#888' }}>Loading...</div>}
-          {!loading && contacts.length === 0 && (
-            <div style={{ padding: '16px', fontSize: '12px', color: '#888', textAlign: 'center' }}>No contacts yet</div>
-          )}
-          {contacts.map(contact => (
-            <div
-              key={contact.chat_id}
-              onClick={() => selectContact(contact)}
-              style={{
-                padding: '14px', borderRadius: '8px', marginBottom: '6px', cursor: 'pointer',
-                background: selected?.chat_id === contact.chat_id ? '#1a1a1a' : 'transparent',
-                border: selected?.chat_id === contact.chat_id ? '1px solid #333' : '1px solid transparent',
-                transition: 'all 0.15s',
-                position: 'relative',
-                group: 'relative'
-              }}
-              onMouseOver={(e) => {
-                if (selected?.chat_id !== contact.chat_id) {
-                  e.currentTarget.style.background = '#111'
-                  e.currentTarget.style.borderColor = '#222'
-                }
-              }}
-              onMouseOut={(e) => {
-                if (selected?.chat_id !== contact.chat_id) {
-                  e.currentTarget.style.background = 'transparent'
-                  e.currentTarget.style.borderColor = 'transparent'
-                }
-              }}
-            >
-              <div style={{ fontSize: '13px', fontWeight: 600, fontFamily: "'Syne', sans-serif", marginBottom: '4px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                {contact.name || 'Unknown'}
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    editContact(contact)
-                  }}
-                  style={{
-                    background: 'none', border: 'none', color: '#888', cursor: 'pointer',
-                    fontSize: '10px', padding: '0 4px', opacity: 0, transition: 'opacity 0.2s'
-                  }}
-                  onMouseOver={(e) => e.target.style.opacity = '1'}
-                >
-                  ✎
-                </button>
-              </div>
-              <div style={{ fontSize: '11px', color: '#888', marginBottom: '6px', display: 'flex', justifyContent: 'space-between' }}>
-                <span>{contact.message_count || 0} msgs</span>
-              </div>
-              {contact.relationship && (
-                <div style={{ fontSize: '10px', color: '#666', marginBottom: '4px' }}>{contact.relationship}</div>
-              )}
-              <div style={{ fontSize: '9px', color: '#555', display: 'flex', gap: '6px' }}>
-                {contact.portfolio_shared && <span style={{ background: 'rgba(124,58,237,0.1)', padding: '2px 6px', borderRadius: '4px', border: '1px solid rgba(124,58,237,0.2)' }}>portfolio</span>}
-                {contact.calendly_shared && <span style={{ background: 'rgba(34,197,94,0.1)', padding: '2px 6px', borderRadius: '4px', border: '1px solid rgba(34,197,94,0.2)' }}>booked</span>}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* MAIN CONTENT */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        
-        {/* TOPBAR */}
-        <div style={{ padding: '24px 32px', borderBottom: '1px solid #222', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#0a0a0a' }}>
-          <div>
-            <div style={{ fontSize: '18px', fontWeight: 700, fontFamily: "'Syne', sans-serif" }}>
-              {selected ? selected.name || 'Unknown' : 'Max Dashboard'}
-            </div>
-            <div style={{ fontSize: '11px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>
-              {selected ? `${selected.relationship || 'Contact'} • ${selected.tone || 'friendly'} tone` : 'Select a conversation'}
-            </div>
-          </div>
-          <div style={{ display: 'flex', gap: '24px' }}>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: '24px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{contacts.length}</div>
-              <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>CONTACTS</div>
-            </div>
-            <div style={{ textAlign: 'right' }}>
-              <div style={{ fontSize: '24px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{totalMessages}</div>
-              <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>MESSAGES</div>
-            </div>
-          </div>
-        </div>
-
-        {/* MESSAGES */}
-        {!selected ? (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#666', gap: '12px' }}>
-            <div style={{ fontSize: '16px', fontFamily: "'Syne', sans-serif", color: '#888' }}>No conversation selected</div>
-            <div style={{ fontSize: '12px' }}>Pick a contact from the sidebar to view messages</div>
-          </div>
-        ) : (
-          <div style={{ flex: 1, overflowY: 'auto', padding: '24px 32px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            {messages.map((m, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: m.role === 'assistant' ? 'flex-end' : 'flex-start' }}>
-                <div style={{ maxWidth: '65%' }}>
-                  <div style={{ fontSize: '10px', color: '#888', marginBottom: '4px', textAlign: m.role === 'assistant' ? 'right' : 'left', letterSpacing: '0.3px' }}>
-                    {m.role === 'assistant' ? 'MAX' : (selected.name || 'THEM').toUpperCase()}
-                  </div>
-                  <div style={{
-                    padding: '12px 16px', borderRadius: m.role === 'assistant' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-                    background: m.role === 'assistant' ? '#c8f562' : '#1a1a1a',
-                    color: m.role === 'assistant' ? '#0a0a0a' : '#f0f0f0',
-                    fontSize: '13px', lineHeight: '1.6',
-                    border: m.role === 'assistant' ? 'none' : '1px solid #222'
-                  }}>
-                    {m.content}
-                  </div>
-                </div>
-              </div>
-            ))}
-            <div ref={messagesEndRef} />
-          </div>
-        )}
-
-        {/* COMMAND INPUT */}
-        <div style={{ padding: '16px 32px', borderTop: '1px solid #222', background: '#0a0a0a', display: 'flex', gap: '12px' }}>
-          <input
-            type="text"
-            value={command}
-            onChange={e => setCommand(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && sendCommand()}
-            placeholder="Type a command for Max... e.g. Message Chidera to check on her"
-            style={{
-              flex: 1, padding: '12px 16px', borderRadius: '8px', border: '1px solid #222',
-              background: '#111', color: '#f0f0f0', fontFamily: "'DM Mono', monospace",
-              fontSize: '12px', outline: 'none', transition: 'border-color 0.2s'
-            }}
-            onFocus={(e) => e.target.style.borderColor = '#333'}
-            onBlur={(e) => e.target.style.borderColor = '#222'}
-          />
-          <button
-            onClick={() => sendCommand()}
-            style={{
-              padding: '12px 28px', borderRadius: '8px', border: 'none',
-              background: sending ? '#333' : '#c8f562', color: sending ? '#888' : '#0a0a0a',
-              fontFamily: "'Syne', sans-serif", fontWeight: 700, fontSize: '13px',
-              cursor: sending ? 'not-allowed' : 'pointer', transition: 'all 0.2s'
-            }}
-          >
-            {sending ? 'Sending...' : 'Send'}
-          </button>
-        </div>
-
-        {/* STATS */}
-        <div style={{ padding: '16px 32px', borderTop: '1px solid #222', background: '#0a0a0a', display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '12px' }}>
-          <div style={{ padding: '16px', borderRadius: '8px', background: '#111', border: '1px solid #222' }}>
-            <div style={{ fontSize: '20px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{contacts.length}</div>
-            <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>TOTAL CONTACTS</div>
-          </div>
-          <div style={{ padding: '16px', borderRadius: '8px', background: '#111', border: '1px solid #222' }}>
-            <div style={{ fontSize: '20px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{totalMessages}</div>
-            <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>TOTAL MESSAGES</div>
-          </div>
-          <div style={{ padding: '16px', borderRadius: '8px', background: '#111', border: '1px solid #222' }}>
-            <div style={{ fontSize: '20px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{portfolioShared}</div>
-            <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>PORTFOLIO SHARED</div>
-          </div>
-          <div style={{ padding: '16px', borderRadius: '8px', background: '#111', border: '1px solid #222' }}>
-            <div style={{ fontSize: '20px', fontWeight: 800, fontFamily: "'Syne', sans-serif", color: '#c8f562' }}>{calendlyShared}</div>
-            <div style={{ fontSize: '10px', color: '#888', marginTop: '4px', letterSpacing: '0.5px' }}>MEETINGS BOOKED</div>
-          </div>
-        </div>
-      </div>
-
-      {/* ADD/EDIT CONTACT MODAL */}
-      {showAddContact && (
-        <div style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex',
-          alignItems: 'center', justifyContent: 'center', zIndex: 1000
-        }} onClick={() => setShowAddContact(false)}>
-          <div style={{
-            background: '#1a1a1a', borderRadius: '12px', padding: '32px', maxWidth: '400px',
-            width: '90%', border: '1px solid #222', boxShadow: '0 20px 60px rgba(0,0,0,0.5)'
-          }} onClick={(e) => e.stopPropagation()}>
-            <h2 style={{ fontSize: '18px', fontWeight: 700, fontFamily: "'Syne', sans-serif", marginBottom: '24px' }}>
-              {editingContact ? 'Edit Contact' : 'Add New Contact'}
-            </h2>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', color: '#888', marginBottom: '6px', fontWeight: 600 }}>Name</label>
-                <input
-                  type="text"
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  placeholder="e.g., Chidera"
-                  style={{
-                    width: '100%', padding: '10px 14px', borderRadius: '6px', border: '1px solid #222',
-                    background: '#111', color: '#f0f0f0', fontSize: '13px', outline: 'none'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', color: '#888', marginBottom: '6px', fontWeight: 600 }}>WhatsApp Number</label>
-                <input
-                  type="tel"
-                  value={formData.number}
-                  onChange={(e) => setFormData({ ...formData, number: e.target.value })}
-                  placeholder="e.g., 08012345678"
-                  style={{
-                    width: '100%', padding: '10px 14px', borderRadius: '6px', border: '1px solid #222',
-                    background: '#111', color: '#f0f0f0', fontSize: '13px', outline: 'none'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', color: '#888', marginBottom: '6px', fontWeight: 600 }}>Relationship (Optional)</label>
-                <input
-                  type="text"
-                  value={formData.relationship}
-                  onChange={(e) => setFormData({ ...formData, relationship: e.target.value })}
-                  placeholder="e.g., Best friend, Client, Manager"
-                  style={{
-                    width: '100%', padding: '10px 14px', borderRadius: '6px', border: '1px solid #222',
-                    background: '#111', color: '#f0f0f0', fontSize: '13px', outline: 'none'
-                  }}
-                />
-              </div>
-
-              <div>
-                <label style={{ display: 'block', fontSize: '12px', color: '#888', marginBottom: '6px', fontWeight: 600 }}>Tone</label>
-                <select
-                  value={formData.tone}
-                  onChange={(e) => setFormData({ ...formData, tone: e.target.value })}
-                  style={{
-                    width: '100%', padding: '10px 14px', borderRadius: '6px', border: '1px solid #222',
-                    background: '#111', color: '#f0f0f0', fontSize: '13px', outline: 'none'
-                  }}
-                >
-                  <option value="friendly">Friendly</option>
-                  <option value="professional">Professional</option>
-                  <option value="casual">Casual</option>
-                  <option value="formal">Formal</option>
-                </select>
-              </div>
-
-              <div style={{ display: 'flex', gap: '12px', marginTop: '8px' }}>
-                <button
-                  onClick={() => {
-                    setShowAddContact(false)
-                    setEditingContact(null)
-                  }}
-                  style={{
-                    flex: 1, padding: '10px 16px', borderRadius: '6px', border: '1px solid #222',
-                    background: 'transparent', color: '#f0f0f0', fontFamily: "'Syne', sans-serif",
-                    fontWeight: 600, cursor: 'pointer', fontSize: '13px'
-                  }}
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={saveContact}
-                  style={{
-                    flex: 1, padding: '10px 16px', borderRadius: '6px', border: 'none',
-                    background: '#c8f562', color: '#0a0a0a', fontFamily: "'Syne', sans-serif",
-                    fontWeight: 600, cursor: 'pointer', fontSize: '13px'
-                  }}
-                >
-                  {editingContact ? 'Update' : 'Add'}
-                </button>
-                {editingContact && (
-                  <button
-                    onClick={() => {
-                      deleteContact(editingContact.chat_id)
-                      setShowAddContact(false)
-                      setEditingContact(null)
-                    }}
-                    style={{
-                      padding: '10px 16px', borderRadius: '6px', border: '1px solid #ff4444',
-                      background: 'transparent', color: '#ff4444', fontFamily: "'Syne', sans-serif",
-                      fontWeight: 600, cursor: 'pointer', fontSize: '13px'
-                    }}
-                  >
-                    Delete
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  )
+// --- SUPABASE HELPERS ---
+async function getContact(chatId) {
+  const { data } = await supabase.from('contacts').select('*').eq('chat_id', chatId).single();
+  return data;
 }
+
+async function upsertContact(chatId, fields) {
+  const existing = await getContact(chatId);
+  if (existing) {
+    const { error } = await supabase.from('contacts').update(fields).eq('chat_id', chatId);
+    if (error) console.error('❌ Supabase update error:', error.message);
+  } else {
+    const { error } = await supabase.from('contacts').insert({ chat_id: chatId, ...fields });
+    if (error) console.error('❌ Supabase insert error:', error.message);
+    else console.log('✅ Contact saved to Supabase:', chatId);
+  }
+}
+
+async function saveMessage(chatId, role, content) {
+  await supabase.from('messages').insert({ chat_id: chatId, role, content });
+}
+
+async function getHistory(chatId) {
+  const { data } = await supabase.from('messages').select('role, content').eq('chat_id', chatId).order('created_at', { ascending: true });
+  return data || [];
+}
+
+// --- COMMAND HANDLER ---
+async function handleCommand(msg, command) {
+  try {
+    const parsed = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: `Parse this command into JSON. Respond ONLY with valid JSON:
+{
+  "action": "send_message|send_calendly|send_portfolio|unknown",
+  "recipient_name": "name",
+  "recipient_number": "phone if mentioned, else null",
+  "message_context": "what to say",
+  "tone": "friendly|formal|casual"
+}`
+        },
+        { role: 'user', content: command }
+      ]
+    });
+
+    const raw = parsed.choices[0].message.content.trim();
+    console.log('🧠 Parsed:', raw);
+
+    let instruction = JSON.parse(raw);
+
+    if (instruction.action === 'unknown' || !instruction.recipient_name) {
+      await msg.reply("❌ Who should Max message?");
+      return;
+    }
+
+    // Check if contact already exists
+    let chatId = null;
+    let existingContact = null;
+    
+    if (instruction.recipient_number) {
+      let number = instruction.recipient_number.replace(/\D/g, '');
+      if (number.startsWith('0')) number = '234' + number.slice(1);
+      chatId = `${number}@s.whatsapp.net`;
+      existingContact = await getContact(chatId);
+    } else {
+      // Try to find by name in database
+      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single();
+      if (data) {
+        chatId = data.chat_id;
+        existingContact = data;
+      }
+    }
+
+    // If no number and no existing contact, ask for it
+    if (!chatId) {
+      await msg.reply(`What's ${instruction.recipient_name}'s number? (e.g., 08012345678)`);
+      return;
+    }
+
+    // Update or create contact
+    await upsertContact(chatId, {
+      name: instruction.recipient_name,
+      relationship: instruction.relationship || existingContact?.relationship || '',
+      tone: instruction.tone || 'friendly',
+      portfolio_shared: existingContact?.portfolio_shared || instruction.action === 'send_portfolio',
+      calendly_shared: existingContact?.calendly_shared || instruction.action === 'send_calendly',
+      message_count: existingContact?.message_count || 1
+    });
+
+    const crafted = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: `${MAX_SYSTEM_PROMPT}
+You are relaying Tobi's message to ${instruction.recipient_name}.
+START with: "Tobi wanted me to tell you..." or "Tobi says..." — frame it clearly as coming from him through you.
+Never say "I" or "I'll" — always attribute actions/words to Tobi.
+Keep it short and natural.
+${instruction.action === 'send_portfolio' ? 'Include portfolio link naturally.' : ''}
+${instruction.action === 'send_calendly' ? 'Include Calendly link naturally.' : ''}
+Example: If Tobi says "tell Grace I'll catch up soon" → write "Hey Grace, Tobi said he'll catch up with you soon"`
+        },
+        { role: 'user', content: instruction.message_context }
+      ]
+    });
+
+    const messageToSend = crafted.choices[0].message.content.trim();
+    await saveMessage(chatId, 'assistant', messageToSend);
+    await sock.sendMessage(chatId, { text: messageToSend });
+    await msg.reply(`✅ Messaged ${instruction.recipient_name}`);
+
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    await msg.reply('❌ Something went wrong.');
+  }
+}
+
+// --- BAILEYS CONNECTION ---
+async function connectToWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('/tmp/max-auth');
+  const { version } = await fetchLatestBaileysVersion();
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true,
+    browser: ['Max PA', 'Chrome', '1.0.0'],
+    logger: require('pino')({ level: 'silent' })
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      latestQR = qr;
+      console.log('📱 New QR code generated — visit /qr to scan');
+    }
+
+    if (connection === 'close') {
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('🔌 Connection closed. Reconnecting:', shouldReconnect);
+      if (shouldReconnect) setTimeout(connectToWhatsApp, 5000);
+    }
+
+    if (connection === 'open') {
+      console.log('✅ Max is live and ready to work!');
+      latestQR = null;
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      if (msg.key.fromMe) continue;
+
+      const chatId = msg.key.remoteJid;
+      const senderJid = msg.key.participant || msg.key.remoteJid;
+      const isGroup = chatId.includes('@g.us');
+      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+
+      if (!text || text.trim() === '') continue;
+
+      console.log(`📨 ${isGroup ? 'GROUP' : 'DM'} from ${senderJid}: ${text.substring(0, 50)}`);
+
+      // In groups: only respond if mentioned
+      if (isGroup && !text.toLowerCase().includes('max')) {
+        console.log('⏭️  Skipped — Max not mentioned');
+        continue;
+      }
+
+      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace('@s.whatsapp.net', '').replace('@lid', '');
+      const senderNumber = senderJid.replace('@s.whatsapp.net', '').replace('@lid', '');
+      const isFromMain = senderNumber.includes(mainNumber) || mainNumber.includes(senderNumber);
+
+      const replyFn = async (replyText) => {
+        await sock.sendMessage(chatId, { text: replyText });
+      };
+
+      const msgObj = { from: senderJid, body: text, reply: replyFn };
+
+      if (isFromMain) {
+        console.log(`📩 Command from Tobi: ${text}`);
+
+// Ask Groq to decide what type of request this is
+      const intentCheck = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an intent classifier for a WhatsApp PA bot.
+Classify the user's message into one of these intents and respond ONLY with the intent word:
+- "command" → they want to message/reach out/send something to someone else
+- "chat" → they are chatting, updating, venting, or asking Max something conversational
+- "creative" → they want Max to write something (status post, caption, draft, message template, content)
+
+Examples:
+"Message John about the project" → command
+"Hey max" → chat  
+"Going well, logo approved" → chat
+"Come up with a WhatsApp status post" → creative
+"Write me a caption for my portfolio" → creative
+"How are you" → chat
+"Send Chidera my Calendly link" → command`
+          },
+          { role: 'user', content: text }
+        ]
+      });
+
+      const intent = intentCheck.choices[0].message.content.trim().toLowerCase();
+      console.log(`🎯 Intent: ${intent}`);
+
+      if (intent === 'command') {
+        // For commands, check if we have the contact stored first
+        const existingContact = await getContact(chatId);
+        if (existingContact) {
+          // User is messaging an existing contact, treat this as a natural conversation instead
+          // So we can respond with context from stored info
+          console.log(`📌 Message to known contact ${existingContact.name}, handling as conversation`);
+          intent = 'chat'; // Treat known contacts as chat, not command
+        } else {
+          await handleCommand(msgObj, text);
+          return;
+        }
+      }
+
+      // For both chat and creative — use minimal history (save tokens)
+      const tobiHistory = await getHistory(`tobi-${chatId}`);
+      const historyMessages = tobiHistory.slice(-3).map(m => ({ role: m.role, content: m.content }));
+
+      const systemPrompt = intent === 'creative'
+        ? `${MAX_SYSTEM_PROMPT}
+Tobi is asking you to create content for him. Write exactly what he asked for — no explanations, no preamble.
+If he wants a WhatsApp status, write a clean status post.
+If he wants a caption, write the caption.
+If he wants a draft, write the draft.
+Just deliver the content directly.`
+        : `${MAX_SYSTEM_PROMPT}
+Tobi is texting you directly. You are his PA having an ongoing conversation.
+CRITICAL: Never repeat the same response twice — always vary how you answer.
+Remember what he's already told you in this conversation and don't repeat questions.
+Be natural, brief, and genuinely helpful.
+Don't keep asking about the same thing he already answered.
+Never use canned phrases — respond naturally to what he actually said.
+Return only your reply, nothing else.`;
+
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...historyMessages,
+          { role: 'user', content: text }
+        ]
+      });
+
+      const reply = response.choices[0].message.content.trim();
+
+      // Save tobi's direct conversation history
+      await saveMessage(`tobi-${chatId}`, 'user', text);
+      await saveMessage(`tobi-${chatId}`, 'assistant', reply);
+
+      await sock.sendMessage(chatId, { text: reply });
+        return;
+      }
+
+      // Reply from someone else
+      let contact = await getContact(chatId);
+      if (!contact) {
+        await upsertContact(chatId, { name: 'Unknown', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
+        contact = await getContact(chatId);
+      }
+      if (!contact) return;
+
+      const isEstablished = contact.message_count > 0;
+      await saveMessage(chatId, 'user', text);
+      await supabase.from('contacts').update({ message_count: (contact.message_count || 0) + 1 }).eq('chat_id', chatId);
+
+      // Only fetch minimal history
+      const history = await getHistory(chatId);
+      const recentHistory = history.slice(-2).map(m => ({ role: m.role, content: m.content }));
+
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: `${MAX_SYSTEM_PROMPT}
+Replying to ${contact.name} on behalf of Tobi.
+${isEstablished ? 'You know them — be warm and natural, no intro needed.' : 'First contact — be warm but brief.'}
+CRITICAL: Speak AS Tobi's PA. When relaying what Tobi will do or feel, ALWAYS say "Tobi..." or "He..." — NEVER use "I" or "I'll"
+If they say "When can you meet?" → reply "Tobi's schedule is..." NOT "I'll..."
+If they say "How are you?" → reply "I'm good thanks" (you're Max, be personable)
+Keep it 1-2 sentences. NEVER repeat the same response — make each reply unique.
+Look at the history and never say the same thing twice. Vary your language and structure.
+Just reply naturally to what they said.`
+          },
+          ...recentHistory,
+          { role: 'user', content: text }
+        ]
+      });
+
+      const reply = response.choices[0].message.content.trim();
+      await saveMessage(chatId, 'assistant', reply);
+
+      if (reply.includes('tobidavid.dexcraft.agency')) await supabase.from('contacts').update({ portfolio_shared: true }).eq('chat_id', chatId);
+      if (reply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
+
+      await sock.sendMessage(chatId, { text: reply });
+      console.log(`✅ Replied to ${contact.name}`);
+
+      // Only notify if new contact or first message
+      if (!isEstablished) {
+        const mainJid = process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`;
+        try {
+          await sock.sendMessage(mainJid, {
+            text: `🔔 NEW: ${contact.name}\n\n_"${text}"_\n\nMax: _"${reply}"_`
+          });
+        } catch (err) {
+          console.error('Notify error:', err.message);
+        }
+      }
+    }
+  });
+}
+
+connectToWhatsApp();
