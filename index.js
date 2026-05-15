@@ -138,30 +138,38 @@ async function handleCommand(msg, command) {
       messages: [
         {
           role: 'system',
-          content: `Parse this command into JSON. Respond ONLY with valid JSON:
+          content: `Extract ONLY these fields from the command. Respond ONLY with valid JSON:
 {
-  "action": "send_message|send_calendly|send_portfolio|unknown",
-  "recipient_name": "name",
-  "recipient_number": "phone if mentioned, else null",
-  "message_context": "what to say",
-  "tone": "friendly|formal|casual"
-}`
+  "recipient_name": "who to message (required)",
+  "recipient_number": "phone number if explicitly mentioned, else null",
+  "message": "exact message Tobi wants to send - extract word for word",
+  "include_portfolio": false,
+  "include_calendly": false
+}
+
+RULES:
+- ONLY include_portfolio=true if Tobi explicitly says "send portfolio" or "share my portfolio"
+- ONLY include_calendly=true if Tobi explicitly says "send calendly" or "share booking link"
+- Otherwise ALWAYS set both to false
+- message MUST be exactly what Tobi said to send - do NOT add extra context
+- If Tobi says "tell dara send me the basse3 link" → message: "Send me the Basse3 website link once you're done"
+- Do NOT interpret - just extract`
         },
         { role: 'user', content: command }
       ]
     });
 
     const raw = parsed.choices[0].message.content.trim();
-    console.log('🧠 Parsed:', raw);
+    console.log('Parsed command:', raw);
 
     let instruction = JSON.parse(raw);
 
-    if (instruction.action === 'unknown' || !instruction.recipient_name) {
-      await msg.reply("❌ Who should Max message?");
+    if (!instruction.recipient_name) {
+      await msg.reply("Who should Max message?");
       return;
     }
 
-    // Check if contact already exists
+    // Check if contact exists by name or number
     let chatId = null;
     let existingContact = null;
     
@@ -171,56 +179,47 @@ async function handleCommand(msg, command) {
       chatId = `${number}@s.whatsapp.net`;
       existingContact = await getContact(chatId);
     } else {
-      // Try to find by name in database
-      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single();
+      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single().catch(() => ({ data: null }));
       if (data) {
         chatId = data.chat_id;
         existingContact = data;
       }
     }
 
-    // If no number and no existing contact, ask for it
+    // If no number, ask for it
     if (!chatId) {
       await msg.reply(`What's ${instruction.recipient_name}'s number? (e.g., 08012345678)`);
       return;
     }
 
-    // Update or create contact
+    // Save or update contact
     await upsertContact(chatId, {
       name: instruction.recipient_name,
-      relationship: instruction.relationship || existingContact?.relationship || '',
-      tone: instruction.tone || 'friendly',
-      portfolio_shared: existingContact?.portfolio_shared || instruction.action === 'send_portfolio',
-      calendly_shared: existingContact?.calendly_shared || instruction.action === 'send_calendly',
-      message_count: existingContact?.message_count || 1
+      relationship: existingContact?.relationship || '',
+      tone: existingContact?.tone || 'friendly',
+      portfolio_shared: existingContact?.portfolio_shared || instruction.include_portfolio === true,
+      calendly_shared: existingContact?.calendly_shared || instruction.include_calendly === true,
+      message_count: (existingContact?.message_count || 0) + 1
     });
 
-    const crafted = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        {
-          role: 'system',
-          content: `${MAX_SYSTEM_PROMPT}
-You are relaying Tobi's message to ${instruction.recipient_name}.
-START with: "Tobi wanted me to tell you..." or "Tobi says..." — frame it clearly as coming from him through you.
-Never say "I" or "I'll" — always attribute actions/words to Tobi.
-Keep it short and natural.
-${instruction.action === 'send_portfolio' ? 'Include portfolio link naturally.' : ''}
-${instruction.action === 'send_calendly' ? 'Include Calendly link naturally.' : ''}
-Example: If Tobi says "tell Grace I'll catch up soon" → write "Hey Grace, Tobi said he'll catch up with you soon"`
-        },
-        { role: 'user', content: instruction.message_context }
-      ]
-    });
+    // Build the final message
+    let finalMessage = instruction.message || '';
+    
+    if (instruction.include_portfolio === true) {
+      finalMessage += `\n\nPortfolio: https://tobidavid.dexcraft.agency`;
+    }
+    if (instruction.include_calendly === true) {
+      finalMessage += `\n\nBooking: ${process.env.CALENDLY_LINK}`;
+    }
 
-    const messageToSend = crafted.choices[0].message.content.trim();
-    await saveMessage(chatId, 'assistant', messageToSend);
-    await sock.sendMessage(chatId, { text: messageToSend });
+    // Send message
+    await saveMessage(chatId, 'assistant', finalMessage);
+    await sock.sendMessage(chatId, { text: finalMessage });
     await msg.reply(`✅ Messaged ${instruction.recipient_name}`);
 
   } catch (err) {
-    console.error('❌ Error:', err.message);
-    await msg.reply('❌ Something went wrong.');
+    console.error('Command error:', err.message);
+    await msg.reply('Something went wrong.');
   }
 }
 
@@ -288,6 +287,13 @@ async function connectToWhatsApp() {
       const isFromMain = mainNumber === senderNumber;
 
       console.log(`[v0] Checking sender: raw="${senderJid}" → cleaned="${senderNumber}" | main="${mainNumber}" | match=${isFromMain}`);
+      
+      // DIAGNOSTIC: If they type "debug" show the numbers being compared
+      if (text.toLowerCase().includes('debug')) {
+        await sock.sendMessage(chatId, { 
+          text: `DEBUG:\nSender JID: ${senderJid}\nSender cleaned: ${senderNumber}\nMain number: ${mainNumber}\nMain from env: ${process.env.YOUR_MAIN_NUMBER}\nMatch: ${isFromMain ? '✅ YES' : '❌ NO'}` 
+        });
+      }
 
       const replyFn = async (replyText) => {
         await sock.sendMessage(chatId, { text: replyText });
