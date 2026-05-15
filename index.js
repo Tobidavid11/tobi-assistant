@@ -169,8 +169,7 @@ RULES:
     } catch (parseErr) {
       console.error('[v0] JSON parse error:', parseErr.message);
       console.error('[v0] Raw response:', raw);
-      await msg.reply("Couldn't parse that command. Try: 'message dara to send the basse3 link'");
-      return;
+await msg.reply("Couldn't understand that. Try being more specific.");      return;
     }
 
     if (!instruction.recipient_name) {
