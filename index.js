@@ -338,11 +338,9 @@ Return only your reply.`
         return;
       }
 
-      // --- SOMEONE ELSE'S MESSAGE ---
-      let contact = await getContact(chatId);
 // --- SOMEONE ELSE'S MESSAGE ---
-      contact = await getContact(chatId);
-      if (!contact) { 
+      let contact = await getContact(chatId);
+      if (!contact) {
         await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
       }
@@ -354,22 +352,18 @@ Return only your reply.`
       const history = await getHistory(chatId, 10);
       const isKnown = (contact.message_count || 0) > 0;
 
-      // Detect the energy/tone of their message
       const energyCheck = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
         max_tokens: 10,
         messages: [
-          {
-            role: 'system',
-            content: `Classify the tone of this message in ONE word: "casual", "formal", "playful", "serious", "emotional"`
-          },
+          { role: 'system', content: `Classify the tone of this message in ONE word: "casual", "formal", "playful", "serious", "emotional"` },
           { role: 'user', content: text }
         ]
       });
 
       const messageEnergy = energyCheck.choices[0].message.content.trim().toLowerCase().split(/\s/)[0];
 
-      const response = await groq.chat.completions.create({
+      const contactResponse = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
         max_tokens: 150,
         messages: [
@@ -377,46 +371,40 @@ Return only your reply.`
             role: 'system',
             content: `${MAX_SYSTEM_PROMPT}
 
-You are replying to ${contact.name} on Tobi's behalf.
-Contact info:
+You are Max, replying to ${contact.name} who is messaging Tobi's assistant number.
 - Relationship: ${contact.relationship || 'contact'}
-- Saved tone: ${contact.tone || 'friendly'}
-- Known contact (talked before): ${isKnown ? 'YES — never re-introduce yourself' : 'NO — brief natural intro fine'}
-- Their message energy right now: ${messageEnergy}
+- Known contact: ${isKnown ? 'YES — never re-introduce yourself' : 'NO — brief natural intro fine'}
+- Their message energy: ${messageEnergy}
 
-HOW TO RESPOND:
-- Match their energy. If they're casual and playful, be casual and playful back. If formal, be professional.
-- Read the conversation history and respond to what they actually said
+CRITICAL RULES:
+- You are talking to ${contact.name}, NOT Tobi. Never confuse who you are talking to.
+- Never call this person "Tobi" or assume they are Tobi
+- Match their energy — casual/playful = casual back, formal = professional
 - Keep it SHORT — 1-3 sentences max
-- NEVER bring up Tobi's personal life, relationships, or private matters unless they specifically ask
-- NEVER add information they didn't ask for
-- NEVER mention Chidera, personal projects, or Tobi's schedule unprompted
-- If they ask where Tobi is: "He's pretty swamped right now, but I'll make sure he sees this."
-- If they're joking around, joke back naturally
-- If they're serious, be serious
-- You know Tobi well, so you can speak naturally on his behalf — but keep personal details private
-- Do NOT use "I'm Max, Tobi's PA" if they already know you
+- NEVER bring up Tobi's personal life, relationships, or private matters
+- NEVER add unrequested information
+- If they ask where Tobi is: "He's pretty swamped right now, I'll make sure he sees this."
+- Do NOT re-introduce yourself if they already know you
 
-Return ONLY the reply message. Nothing else.`
+Return ONLY the reply message.`
           },
           ...history
         ]
       });
 
-      const reply = response.choices[0].message.content.trim();
-      await saveMessage(chatId, 'assistant', reply);
+      const contactReply = contactResponse.choices[0].message.content.trim();
+      await saveMessage(chatId, 'assistant', contactReply);
 
-      if (reply.includes('tobidavid.dexcraft.agency')) await supabase.from('contacts').update({ portfolio_shared: true }).eq('chat_id', chatId);
-      if (reply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
+      if (contactReply.includes('tobidavid.dexcraft.agency')) await supabase.from('contacts').update({ portfolio_shared: true }).eq('chat_id', chatId);
+      if (contactReply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
 
-      await sock.sendMessage(chatId, { text: reply });
+      await sock.sendMessage(chatId, { text: contactReply });
       console.log(`✅ Max replied to ${contact.name}`);
 
-    mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/[@\w.]+$/, '').replace(/\D/g, '');
-      const mainJid = mainNumber.startsWith('234') ? `${mainNumber}@s.whatsapp.net` : `234${mainNumber.slice(1)}@s.whatsapp.net`;
+      const notifyJid = mainNumber.startsWith('234') ? `${mainNumber}@s.whatsapp.net` : `234${mainNumber.slice(1)}@s.whatsapp.net`;
       try {
-        await sock.sendMessage(mainJid, {
-          text: `🔔 *${contact.name || 'Someone'} said:* ${text}\n\n*Max replied:* ${reply}`
+        await sock.sendMessage(notifyJid, {
+          text: `🔔 *${contact.name || 'Someone'} said:* ${text}\n\n*Max replied:* ${contactReply}`
         });
       } catch (e) { console.error('Notify failed:', e.message); }
     }
