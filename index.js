@@ -160,9 +160,17 @@ RULES:
     });
 
     const raw = parsed.choices[0].message.content.trim();
-    console.log('Parsed command:', raw);
+    console.log('[v0] Parsed command:', raw);
 
-    let instruction = JSON.parse(raw);
+    let instruction;
+    try {
+      instruction = JSON.parse(raw);
+    } catch (parseErr) {
+      console.error('[v0] JSON parse error:', parseErr.message);
+      console.error('[v0] Raw response:', raw);
+      await msg.reply("Couldn't parse that command. Try: 'message dara to send the basse3 link'");
+      return;
+    }
 
     if (!instruction.recipient_name) {
       await msg.reply("Who should Max message?");
@@ -179,10 +187,15 @@ RULES:
       chatId = `${number}@s.whatsapp.net`;
       existingContact = await getContact(chatId);
     } else {
-      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single().catch(() => ({ data: null }));
-      if (data) {
-        chatId = data.chat_id;
-        existingContact = data;
+      // Try to find contact by name
+      try {
+        const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).maybeSingle();
+        if (data) {
+          chatId = data.chat_id;
+          existingContact = data;
+        }
+      } catch (err) {
+        console.log('Contact lookup failed:', err.message);
       }
     }
 
@@ -218,8 +231,9 @@ RULES:
     await msg.reply(`✅ Messaged ${instruction.recipient_name}`);
 
   } catch (err) {
-    console.error('Command error:', err.message);
-    await msg.reply('Something went wrong.');
+    console.error('[v0] Command handler error:', err.message);
+    console.error('[v0] Stack:', err.stack);
+    await msg.reply('Something went wrong. Please try again.');
   }
 }
 
