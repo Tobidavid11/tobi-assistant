@@ -164,7 +164,8 @@ RULES:
 
     let instruction;
     try {
-      instruction = JSON.parse(raw);
+      const cleaned = raw.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+      instruction = JSON.parse(cleaned);
     } catch (parseErr) {
       console.error('[v0] JSON parse error:', parseErr.message);
       console.error('[v0] Raw response:', raw);
