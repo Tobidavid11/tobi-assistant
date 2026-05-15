@@ -342,7 +342,7 @@ Return only your reply.`
       let contact = await getContact(chatId);
 // --- SOMEONE ELSE'S MESSAGE ---
       contact = await getContact(chatId);
-      if (!contact) {
+      if (!contact) { 
         await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
       }
@@ -412,7 +412,7 @@ Return ONLY the reply message. Nothing else.`
       await sock.sendMessage(chatId, { text: reply });
       console.log(`✅ Max replied to ${contact.name}`);
 
-      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/[@\w.]+$/, '').replace(/\D/g, '');
+    mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/[@\w.]+$/, '').replace(/\D/g, '');
       const mainJid = mainNumber.startsWith('234') ? `${mainNumber}@s.whatsapp.net` : `234${mainNumber.slice(1)}@s.whatsapp.net`;
       try {
         await sock.sendMessage(mainJid, {
