@@ -313,9 +313,17 @@ chat = everything else (updates, questions, conversation)`
           messages: [
             {
               role: 'system',
-              content: `${MAX_SYSTEM_PROMPT}
-Tobi is messaging you directly. You are his PA.
-${intent === 'creative' ? 'He wants you to CREATE content. Deliver it directly — no preamble, no explanation. Just the content itself.' : 'Have a natural conversation. Remember what he told you. Do NOT repeat questions he already answered. Be brief.'}
+             content: `${MAX_SYSTEM_PROMPT}
+Tobi is messaging you directly. You are his trusted PA.
+${intent === 'creative' 
+  ? 'He wants you to CREATE content. Deliver ONLY the content — no intro, no explanation, no preamble.' 
+  : `Chat naturally with him. Rules:
+- Remember everything he told you already — never repeat questions
+- Match his energy — if he speaks pidgin, speak pidgin back
+- Don't add suggestions, reminders, or tasks he didn't ask for
+- Don't tell him what to do or motivate him unless he asks
+- Just vibe with him naturally like a trusted PA who knows him well
+- Keep replies SHORT`}
 Return only your reply.`
             },
             ...tobiHistory,
@@ -332,6 +340,8 @@ Return only your reply.`
 
       // --- SOMEONE ELSE'S MESSAGE ---
       let contact = await getContact(chatId);
+// --- SOMEONE ELSE'S MESSAGE ---
+      let contact = await getContact(chatId);
       if (!contact) {
         await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
@@ -341,28 +351,53 @@ Return only your reply.`
       await saveMessage(chatId, 'user', text);
       await supabase.from('contacts').update({ message_count: (contact.message_count || 0) + 1 }).eq('chat_id', chatId);
 
-      const history = await getHistory(chatId, 8);
+      const history = await getHistory(chatId, 10);
       const isKnown = (contact.message_count || 0) > 0;
+
+      // Detect the energy/tone of their message
+      const energyCheck = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 10,
+        messages: [
+          {
+            role: 'system',
+            content: `Classify the tone of this message in ONE word: "casual", "formal", "playful", "serious", "emotional"`
+          },
+          { role: 'user', content: text }
+        ]
+      });
+
+      const messageEnergy = energyCheck.choices[0].message.content.trim().toLowerCase().split(/\s/)[0];
 
       const response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
-        max_tokens: 200,
+        max_tokens: 150,
         messages: [
           {
             role: 'system',
             content: `${MAX_SYSTEM_PROMPT}
 
 You are replying to ${contact.name} on Tobi's behalf.
+Contact info:
 - Relationship: ${contact.relationship || 'contact'}
-- Tone: ${contact.tone || 'friendly'}
-- Known contact: ${isKnown ? 'YES' : 'NO'}
-- Do NOT re-introduce yourself if known
-- Keep reply SHORT — 1-3 sentences
-- Read the conversation history carefully and respond naturally
-- Do NOT bring up Tobi's personal life unless directly asked
-- If they ask where Tobi is or why he's not responding: "He's pretty swamped right now but I'll make sure he gets your message."
+- Saved tone: ${contact.tone || 'friendly'}
+- Known contact (talked before): ${isKnown ? 'YES — never re-introduce yourself' : 'NO — brief natural intro fine'}
+- Their message energy right now: ${messageEnergy}
 
-Return only the reply message.`
+HOW TO RESPOND:
+- Match their energy. If they're casual and playful, be casual and playful back. If formal, be professional.
+- Read the conversation history and respond to what they actually said
+- Keep it SHORT — 1-3 sentences max
+- NEVER bring up Tobi's personal life, relationships, or private matters unless they specifically ask
+- NEVER add information they didn't ask for
+- NEVER mention Chidera, personal projects, or Tobi's schedule unprompted
+- If they ask where Tobi is: "He's pretty swamped right now, but I'll make sure he sees this."
+- If they're joking around, joke back naturally
+- If they're serious, be serious
+- You know Tobi well, so you can speak naturally on his behalf — but keep personal details private
+- Do NOT use "I'm Max, Tobi's PA" if they already know you
+
+Return ONLY the reply message. Nothing else.`
           },
           ...history
         ]
@@ -377,7 +412,7 @@ Return only the reply message.`
       await sock.sendMessage(chatId, { text: reply });
       console.log(`✅ Max replied to ${contact.name}`);
 
-      // Notify Tobi
+      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/[@\w.]+$/, '').replace(/\D/g, '');
       const mainJid = mainNumber.startsWith('234') ? `${mainNumber}@s.whatsapp.net` : `234${mainNumber.slice(1)}@s.whatsapp.net`;
       try {
         await sock.sendMessage(mainJid, {
