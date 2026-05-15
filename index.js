@@ -341,7 +341,7 @@ Return only your reply.`
       // --- SOMEONE ELSE'S MESSAGE ---
       let contact = await getContact(chatId);
 // --- SOMEONE ELSE'S MESSAGE ---
-      let contact = await getContact(chatId);
+      contact = await getContact(chatId);
       if (!contact) {
         await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
