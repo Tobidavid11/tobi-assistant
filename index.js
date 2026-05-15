@@ -287,6 +287,8 @@ async function connectToWhatsApp() {
       // Direct comparison of just the digits
       const isFromMain = mainNumber === senderNumber;
 
+      console.log(`[v0] Checking sender: raw="${senderJid}" → cleaned="${senderNumber}" | main="${mainNumber}" | match=${isFromMain}`);
+
       const replyFn = async (replyText) => {
         await sock.sendMessage(chatId, { text: replyText });
       };
