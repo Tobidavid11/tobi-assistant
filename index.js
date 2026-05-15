@@ -1,11 +1,14 @@
 require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode');
 const Groq = require('groq-sdk');
 const { createClient } = require('@supabase/supabase-js');
 const ws = require('ws');
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
@@ -20,9 +23,7 @@ let sock = null;
 let latestQR = null;
 
 const PORT = process.env.PORT || 3001;
-
 app.get('/health', (req, res) => res.send('Max is alive!'));
-
 app.get('/qr', async (req, res) => {
   if (!latestQR) return res.send('<h2>No QR code yet. Refresh in a few seconds...</h2>');
   const qrImage = await qrcode.toDataURL(latestQR);
@@ -40,7 +41,12 @@ app.get('/qr', async (req, res) => {
 app.post('/command', async (req, res) => {
   const { command } = req.body;
   if (!command) return res.status(400).json({ error: 'No command' });
-  const fakeMsg = { from: process.env.YOUR_MAIN_NUMBER, body: command, reply: async (text) => console.log('Bot reply:', text) };
+  const fakeMsg = {
+    from: process.env.YOUR_MAIN_NUMBER,
+    body: command,
+    reply: async (text) => console.log('Bot reply:', text)
+  };
+  console.log(`📩 Dashboard command: ${command}`);
   try {
     await handleCommand(fakeMsg, command);
     res.json({ success: true });
@@ -49,37 +55,52 @@ app.post('/command', async (req, res) => {
   }
 });
 
+// Sync contacts endpoint
+app.post('/sync-contacts', async (req, res) => {
+  const { contacts } = req.body; // Array of {name, number}
+  if (!contacts || !Array.isArray(contacts)) {
+    return res.status(400).json({ error: 'Send array of {name, number}' });
+  }
+
+  let synced = 0;
+  for (const contact of contacts) {
+    if (!contact.name || !contact.number) continue;
+    let number = contact.number.replace(/\D/g, '');
+    if (number.startsWith('0')) number = '234' + number.slice(1);
+    const chatId = `${number}@s.whatsapp.net`;
+    
+    const existing = await getContact(chatId);
+    if (!existing) {
+      await upsertContact(chatId, {
+        name: contact.name,
+        relationship: contact.relationship || '',
+        tone: 'friendly',
+        message_count: 0
+      });
+      synced++;
+    }
+  }
+  res.json({ synced, total: contacts.length });
+});
+
 app.listen(PORT, () => console.log(`🌐 Dashboard API running on port ${PORT}`));
 
 const MAX_SYSTEM_PROMPT = `
-You are Max, the personal assistant of Tobiloba David (Tobi), a 19-year-old freelance product and brand designer based in Nigeria.
+You are Max, Tobi's personal assistant.
 
-DEEP KNOWLEDGE ABOUT TOBI:
-- Full name: Tobiloba David, goes by Tobi
-- Age: 19, based in Nigeria
-- Twitter/X: @TobiOfFigma (verified)
+CORE RULES:
+- Speak as Tobi's PA — never pretend to be Tobi
+- When relaying Tobi's message: "Tobi said..." or "He wants..." — NEVER use "I" or "I'll" for Tobi's actions
+- Never repeat the same response twice — vary your phrasing each time
+- NEVER bring up work, projects, or personal life unless they ask
+- Never reveal you're an AI
+- Be brief, real, and conversational — this is WhatsApp
+- Match their energy but stay professional
+- Don't gossip or share confidential info
+
+LINKS (use only if relevant):
 - Portfolio: https://tobidavid.dexcraft.agency
 - Booking: ${process.env.CALENDLY_LINK}
-- Freelance product and brand designer — Figma is his main tool
-- Co-founder of Jetherverse with Jayden (Jayden is the founder) — full digital agency covering design, dev, SEO
-- Works at Bitnox Technology under Mr. Femi Faleye
-- Currently working on the Stuard AI project (brand identity)
-- Mentor: Rita Monye
-- Music: Billie Eilish, Justin Bieber, Asa, Fireboy DML, Tems, Eddie Benjamin, Ariana Grande, Qing Madi, Ayra Starr, Asake
-- Ambitious, caring, focused — doesn't watch football, wired to work
-- Warm with people he cares about, professional with everyone else
-
-CHIDERA is extremely special to Tobi — treat her with the highest warmth and respect. Their friendship is growing into something deeper. When keeping her company, be warm, playful, caring.
-
-CRITICAL RULES — NEVER BREAK THESE:
-1. NEVER reveal you are an AI
-2. NEVER bring up Tobi's personal relationships (Chidera etc.) unless the person specifically asks or it's directly relevant
-3. NEVER add information Tobi didn't ask you to share — deliver messages EXACTLY as instructed
-4. NEVER re-introduce yourself to someone you've already talked to
-5. Keep WhatsApp messages SHORT — 1-3 sentences usually enough
-6. Only respond in group chats when directly mentioned/tagged
-7. When Tobi says someone is busy or unavailable — just say they're busy, don't elaborate
-8. If you don't know something about Tobi, say "let me check with Tobi on that"
 `;
 
 // --- SUPABASE HELPERS ---
@@ -88,20 +109,15 @@ async function getContact(chatId) {
   return data;
 }
 
-async function findContactByName(name) {
-  const { data } = await supabase.from('contacts').select('*');
-  if (!data) return null;
-  const lower = name.toLowerCase();
-  return data.find(c => c.name && c.name.toLowerCase().includes(lower)) || null;
-}
-
 async function upsertContact(chatId, fields) {
   const existing = await getContact(chatId);
   if (existing) {
-    await supabase.from('contacts').update(fields).eq('chat_id', chatId);
+    const { error } = await supabase.from('contacts').update(fields).eq('chat_id', chatId);
+    if (error) console.error('❌ Supabase update error:', error.message);
   } else {
     const { error } = await supabase.from('contacts').insert({ chat_id: chatId, ...fields });
-    if (!error) console.log('✅ Contact saved:', chatId);
+    if (error) console.error('❌ Supabase insert error:', error.message);
+    else console.log('✅ Contact saved to Supabase:', chatId);
   }
 }
 
@@ -109,9 +125,9 @@ async function saveMessage(chatId, role, content) {
   await supabase.from('messages').insert({ chat_id: chatId, role, content });
 }
 
-async function getHistory(chatId, limit = 8) {
-  const { data } = await supabase.from('messages').select('role, content').eq('chat_id', chatId).order('created_at', { ascending: false }).limit(limit);
-  return (data || []).reverse();
+async function getHistory(chatId) {
+  const { data } = await supabase.from('messages').select('role, content').eq('chat_id', chatId).order('created_at', { ascending: true });
+  return data || [];
 }
 
 // --- COMMAND HANDLER ---
@@ -119,99 +135,88 @@ async function handleCommand(msg, command) {
   try {
     const parsed = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
-      max_tokens: 300,
       messages: [
         {
           role: 'system',
-          content: `You are a command parser for a WhatsApp PA bot.
-Parse the command and respond ONLY in this JSON format, nothing else:
+          content: `Parse this command into JSON. Respond ONLY with valid JSON:
 {
-  "action": "send_message" | "send_calendly" | "send_portfolio" | "unknown",
-  "recipient_name": "name of person",
-  "recipient_number": "phone number if mentioned, else null",
-  "message_context": "exact message to deliver — preserve the original meaning precisely",
-  "tone": "formal" | "friendly" | "casual" | "special" | "encouraging",
-  "relationship": "who this person is to Tobi if mentioned"
+  "action": "send_message|send_calendly|send_portfolio|unknown",
+  "recipient_name": "name",
+  "recipient_number": "phone if mentioned, else null",
+  "message_context": "what to say",
+  "tone": "friendly|formal|casual"
 }`
         },
         { role: 'user', content: command }
       ]
     });
 
-    let instruction;
-    try { instruction = JSON.parse(parsed.choices[0].message.content.trim()); }
-    catch { await msg.reply("❌ Couldn't parse that command. Try being more specific."); return; }
+    const raw = parsed.choices[0].message.content.trim();
+    console.log('🧠 Parsed:', raw);
 
-    if (!instruction.recipient_name) {
-      await msg.reply("❌ Who should I message?");
+    let instruction = JSON.parse(raw);
+
+    if (instruction.action === 'unknown' || !instruction.recipient_name) {
+      await msg.reply("❌ Who should Max message?");
       return;
     }
 
-    // Check if we know this person already
+    // Check if contact already exists
     let chatId = null;
+    let existingContact = null;
+    
     if (instruction.recipient_number) {
       let number = instruction.recipient_number.replace(/\D/g, '');
       if (number.startsWith('0')) number = '234' + number.slice(1);
       chatId = `${number}@s.whatsapp.net`;
+      existingContact = await getContact(chatId);
     } else {
-      // Look up by name in Supabase
-      const known = await findContactByName(instruction.recipient_name);
-      if (known) {
-        chatId = known.chat_id;
-        console.log(`📌 Found ${instruction.recipient_name} in contacts: ${chatId}`);
-      } else {
-        await msg.reply(`What's ${instruction.recipient_name}'s WhatsApp number? I don't have it saved.`);
-        return;
+      // Try to find by name in database
+      const { data } = await supabase.from('contacts').select('*').eq('name', instruction.recipient_name).single();
+      if (data) {
+        chatId = data.chat_id;
+        existingContact = data;
       }
     }
 
-    // Get existing contact info
-    const existingContact = await getContact(chatId);
-    const isKnown = existingContact && (existingContact.message_count || 0) > 0;
+    // If no number and no existing contact, ask for it
+    if (!chatId) {
+      await msg.reply(`What's ${instruction.recipient_name}'s number? (e.g., 08012345678)`);
+      return;
+    }
 
+    // Update or create contact
     await upsertContact(chatId, {
       name: instruction.recipient_name,
       relationship: instruction.relationship || existingContact?.relationship || '',
-      tone: instruction.tone || existingContact?.tone || 'friendly',
+      tone: instruction.tone || 'friendly',
       portfolio_shared: existingContact?.portfolio_shared || instruction.action === 'send_portfolio',
       calendly_shared: existingContact?.calendly_shared || instruction.action === 'send_calendly',
-      message_count: existingContact?.message_count || 0
+      message_count: existingContact?.message_count || 1
     });
-
-    // Get conversation history for context
-    const history = await getHistory(chatId, 6);
 
     const crafted = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
-      max_tokens: 200,
       messages: [
         {
           role: 'system',
           content: `${MAX_SYSTEM_PROMPT}
-
-You are writing a WhatsApp message to ${instruction.recipient_name} on Tobi's behalf.
-Relationship: ${instruction.relationship || existingContact?.relationship || 'not specified'}
-Tone: ${instruction.tone || 'friendly'}
-Have we talked before: ${isKnown ? 'YES — do NOT introduce yourself again' : 'NO — brief intro as Max is fine'}
-
-CRITICAL: Deliver the message context EXACTLY as Tobi intended. Do not add, remove, or change the meaning.
-Do not add information Tobi didn't ask you to share.
-Keep it SHORT — 2-3 sentences max.
-${instruction.action === 'send_portfolio' ? 'Include portfolio: https://tobidavid.dexcraft.agency' : ''}
-${instruction.action === 'send_calendly' ? `Include booking link: ${process.env.CALENDLY_LINK}` : ''}
-
-Message to deliver: ${instruction.message_context}`
+You are relaying Tobi's message to ${instruction.recipient_name}.
+START with: "Tobi wanted me to tell you..." or "Tobi says..." — frame it clearly as coming from him through you.
+Never say "I" or "I'll" — always attribute actions/words to Tobi.
+Keep it short and natural.
+${instruction.action === 'send_portfolio' ? 'Include portfolio link naturally.' : ''}
+${instruction.action === 'send_calendly' ? 'Include Calendly link naturally.' : ''}
+Example: If Tobi says "tell Grace I'll catch up soon" → write "Hey Grace, Tobi said he'll catch up with you soon"`
         },
-        ...history,
-        { role: 'user', content: `Write the message now.` }
+        { role: 'user', content: instruction.message_context }
       ]
     });
 
     const messageToSend = crafted.choices[0].message.content.trim();
     await saveMessage(chatId, 'assistant', messageToSend);
     await sock.sendMessage(chatId, { text: messageToSend });
-    console.log(`✅ Max messaged ${instruction.recipient_name}`);
-    await msg.reply(`✅ Sent to ${instruction.recipient_name}:\n\n_"${messageToSend}"_`);
+    await msg.reply(`✅ Messaged ${instruction.recipient_name}`);
 
   } catch (err) {
     console.error('❌ Error:', err.message);
@@ -219,7 +224,7 @@ Message to deliver: ${instruction.message_context}`
   }
 }
 
-// --- BAILEYS ---
+// --- BAILEYS CONNECTION ---
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('/tmp/max-auth');
   const { version } = await fetchLatestBaileysVersion();
@@ -236,12 +241,22 @@ async function connectToWhatsApp() {
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) { latestQR = qr; console.log('📱 QR ready — visit /qr'); }
+
+    if (qr) {
+      latestQR = qr;
+      console.log('📱 New QR code generated — visit /qr to scan');
+    }
+
     if (connection === 'close') {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('🔌 Connection closed. Reconnecting:', shouldReconnect);
       if (shouldReconnect) setTimeout(connectToWhatsApp, 5000);
     }
-    if (connection === 'open') { console.log('✅ Max is live and ready to work!'); latestQR = null; }
+
+    if (connection === 'open') {
+      console.log('✅ Max is live and ready to work!');
+      latestQR = null;
+    }
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -251,169 +266,190 @@ async function connectToWhatsApp() {
       if (msg.key.fromMe) continue;
 
       const chatId = msg.key.remoteJid;
-      const senderJid = msg.key.participant || chatId;
+      const senderJid = msg.key.participant || msg.key.remoteJid;
       const isGroup = chatId.includes('@g.us');
       const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
 
       if (!text || text.trim() === '') continue;
 
-      // In groups, only respond if mentioned
-      if (isGroup) {
-        const botNumber = sock.user?.id?.split(':')[0] || '';
-        const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-        const isMentioned = mentioned.some(j => j.includes(botNumber)) || text.toLowerCase().includes('max');
-        if (!isMentioned) continue;
-        console.log(`📨 Group mention from ${senderJid}: ${text}`);
+      console.log(`📨 ${isGroup ? 'GROUP' : 'DM'} from ${senderJid}: ${text.substring(0, 50)}`);
+
+      // In groups: only respond if mentioned
+      if (isGroup && !text.toLowerCase().includes('max')) {
+        console.log('⏭️  Skipped — Max not mentioned');
+        continue;
       }
 
-      console.log(`📨 Message from ${senderJid}: ${text}`);
-
-      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/[@\w.]+$/, '').replace(/\D/g, '');
-      const senderNumber = senderJid.replace(/[@\w.]+$/, '').replace(/\D/g, '');
-      const isFromMain = senderNumber === mainNumber || senderNumber.includes(mainNumber) || mainNumber.includes(senderNumber);
+      // Clean up numbers for comparison
+      const mainNumber = process.env.YOUR_MAIN_NUMBER.replace(/@s\.whatsapp\.net/g, '').replace(/@lid/g, '').replace(/\D/g, '');
+      const senderNumber = senderJid.replace(/@s\.whatsapp\.net/g, '').replace(/@lid/g, '').replace(/\D/g, '');
+      
+      // Direct comparison of just the digits
+      const isFromMain = mainNumber === senderNumber;
 
       const replyFn = async (replyText) => {
         await sock.sendMessage(chatId, { text: replyText });
       };
 
-      // --- TOBI'S MESSAGE ---
-      if (isFromMain) {
-        console.log(`📩 From Tobi: ${text}`);
+      const msgObj = { from: senderJid, body: text, reply: replyFn };
 
+      if (isFromMain) {
+        console.log(`✅ Message from TOBI: ${text.substring(0, 50)}`);
+
+        // Ask Groq to decide what type of request this is
         const intentCheck = await groq.chat.completions.create({
           model: 'llama-3.3-70b-versatile',
-          max_tokens: 10,
           messages: [
             {
               role: 'system',
-              content: `Classify intent as ONLY one word: "command", "chat", or "creative"
-command = message/send/reach out to someone else
-creative = write/draft/create content (status, caption, post)
-chat = everything else (updates, questions, conversation)`
+              content: `You are an intent classifier for a WhatsApp PA bot.
+Classify the user's message into one of these intents and respond ONLY with the intent word:
+- "command" → they want to message/reach out/send something to someone else
+- "chat" → they are chatting, updating, venting, or asking Max something conversational
+- "creative" → they want Max to write something (status post, caption, draft, message template, content)
+
+Examples:
+"Message John about the project" → command
+"Hey max" → chat  
+"Going well, logo approved" → chat
+"Come up with a WhatsApp status post" → creative
+"Write me a caption for my portfolio" → creative
+"How are you" → chat
+"Send Chidera my Calendly link" → command`
             },
             { role: 'user', content: text }
           ]
         });
 
-        const intent = intentCheck.choices[0].message.content.trim().toLowerCase().split(/\s/)[0];
+        let intent = intentCheck.choices[0].message.content.trim().toLowerCase();
         console.log(`🎯 Intent: ${intent}`);
 
         if (intent === 'command') {
-          await handleCommand({ from: senderJid, body: text, reply: replyFn }, text);
-          return;
+          console.log(`📤 Processing as command`);
+          await handleCommand(msgObj, text);
+          continue; // Move to next message
         }
 
-        // Chat or creative — use Tobi's conversation history
-        const tobiChatId = `tobi-direct`;
-        const tobiHistory = await getHistory(tobiChatId, 8);
+        // Handle chat/creative for Tobi
+        // Use minimal history (save tokens)
+        const tobiHistory = await getHistory(`tobi-${chatId}`);
+        const historyMessages = tobiHistory.slice(-3).map(m => ({ role: m.role, content: m.content }));
+
+        const systemPrompt = intent === 'creative'
+          ? `${MAX_SYSTEM_PROMPT}
+Tobi is asking you to create content for him. Write exactly what he asked for — no explanations, no preamble.
+If he wants a WhatsApp status, write a clean status post.
+If he wants a caption, write the caption.
+If he wants a draft, write the draft.
+Just deliver the content directly.`
+          : `${MAX_SYSTEM_PROMPT}
+Tobi is texting you directly. You are his PA having an ongoing conversation.
+CRITICAL: Never repeat the same response twice — always vary how you answer.
+Remember what he's already told you in this conversation and don't repeat questions.
+Be natural, brief, and genuinely helpful.
+Don't keep asking about the same thing he already answered.
+Never use canned phrases — respond naturally to what he actually said.
+Return only your reply, nothing else.`;
 
         const response = await groq.chat.completions.create({
           model: 'llama-3.3-70b-versatile',
-          max_tokens: 250,
           messages: [
-            {
-              role: 'system',
-             content: `${MAX_SYSTEM_PROMPT}
-Tobi is messaging you directly. You are his trusted PA.
-${intent === 'creative' 
-  ? 'He wants you to CREATE content. Deliver ONLY the content — no intro, no explanation, no preamble.' 
-  : `Chat naturally with him. Rules:
-- Remember everything he told you already — never repeat questions
-- Match his energy — if he speaks pidgin, speak pidgin back
-- Don't add suggestions, reminders, or tasks he didn't ask for
-- Don't tell him what to do or motivate him unless he asks
-- Just vibe with him naturally like a trusted PA who knows him well
-- Keep replies SHORT`}
-Return only your reply.`
-            },
-            ...tobiHistory,
+            { role: 'system', content: systemPrompt },
+            ...historyMessages,
             { role: 'user', content: text }
           ]
         });
 
         const reply = response.choices[0].message.content.trim();
-        await saveMessage(tobiChatId, 'user', text);
-        await saveMessage(tobiChatId, 'assistant', reply);
+
+        // Save tobi's direct conversation history
+        await saveMessage(`tobi-${chatId}`, 'user', text);
+        await saveMessage(`tobi-${chatId}`, 'assistant', reply);
+
         await sock.sendMessage(chatId, { text: reply });
-        return;
+        console.log(`💬 Replied to Tobi: ${reply.substring(0, 40)}...`);
+        continue; // Move to next message
       }
 
-// --- SOMEONE ELSE'S MESSAGE ---
+      // Reply from someone else
       let contact = await getContact(chatId);
       if (!contact) {
-        await upsertContact(chatId, { name: 'Someone', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
+        await upsertContact(chatId, { name: 'Unknown', relationship: '', tone: 'friendly', portfolio_shared: false, calendly_shared: false, message_count: 0 });
         contact = await getContact(chatId);
       }
       if (!contact) return;
 
+      const isEstablished = contact.message_count > 0;
       await saveMessage(chatId, 'user', text);
       await supabase.from('contacts').update({ message_count: (contact.message_count || 0) + 1 }).eq('chat_id', chatId);
 
-      const history = await getHistory(chatId, 10);
-      const isKnown = (contact.message_count || 0) > 0;
+      // Only fetch minimal history
+      const history = await getHistory(chatId);
+      const recentHistory = history.slice(-2).map(m => ({ role: m.role, content: m.content }));
 
-      const energyCheck = await groq.chat.completions.create({
+      const response = await groq.chat.completions.create({
         model: 'llama-3.3-70b-versatile',
-        max_tokens: 10,
-        messages: [
-          { role: 'system', content: `Classify the tone of this message in ONE word: "casual", "formal", "playful", "serious", "emotional"` },
-          { role: 'user', content: text }
-        ]
-      });
-
-      const messageEnergy = energyCheck.choices[0].message.content.trim().toLowerCase().split(/\s/)[0];
-
-      const contactResponse = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 150,
         messages: [
           {
             role: 'system',
-content: `${MAX_SYSTEM_PROMPT}
+            content: `You are Max, Tobi's Personal Assistant. You are replying to ${contact.name}.
 
-SITUATION: ${contact.name} has messaged Tobi's assistant WhatsApp number.
-YOU ARE: Max, Tobi's Personal Assistant.
-YOU ARE TALKING TO: ${contact.name} (NOT Tobi).
-TOBI IS YOUR BOSS. ${contact.name} IS THE PERSON YOU ARE TALKING TO.
-You work FOR Tobi. You do NOT work for ${contact.name}.
-Never say "your PA" or "your assistant" to ${contact.name} — you are TOBI'S assistant, not theirs.
-If they ask who you are: "I'm Max, Tobi's personal assistant."
+IDENTITY:
+- You are TOBI'S assistant, not ${contact.name}'s
+- If they ask who you are: "I'm Max, Tobi's personal assistant"
+- ${isEstablished ? 'Known contact — never re-introduce' : 'Likely first contact — brief intro only if needed'}
 
-- Relationship: ${contact.relationship || 'contact'}
-- Known contact: ${isKnown ? 'YES — never re-introduce yourself' : 'NO — brief natural intro fine'}
-- Their message energy: ${messageEnergy}
+YOUR JOB IS SIMPLE:
+- RESPOND to what ${contact.name} just said
+- DO NOT ask new questions or start new topics
+- DO NOT bring up Tobi's work, projects, schedule, or status
+- DO NOT mention Stuard AI, Jetherverse, meetings, or tasks
+- DO NOT say "What's the plan?" or "How are things?" 
+- ONLY reply to exactly what they said to you
 
-CRITICAL RULES:
-- You are talking to ${contact.name}, NOT Tobi. Never confuse who you are talking to.
-- Never call this person "Tobi" or assume they are Tobi
-- Match their energy — casual/playful = casual back, formal = professional
-- Keep it SHORT — 1-3 sentences max
-- NEVER bring up Tobi's personal life, relationships, or private matters
-- NEVER add unrequested information
-- If they ask where Tobi is: "He's pretty swamped right now, I'll make sure he sees this."
-- Do NOT re-introduce yourself if they already know you
+EXAMPLES OF WRONG BEHAVIOR (NEVER DO THIS):
+- They say "Hi Max" → WRONG: "What's the plan for today?" → RIGHT: "Hey! What's up?"
+- They say "Ok boss" → WRONG: "Are you still working on the brand identity?" → RIGHT: "Sounds good"
+- They say "Tutoring and learning" → WRONG: "Cool, Stuard AI project?" → RIGHT: "Nice, that's awesome"
 
-Return ONLY the reply message.`
+IF THEY ASK ABOUT TOBI:
+- "Where's Tobi?" → "He's focused on work right now, pretty busy"
+- "Can Tobi meet?" → "Let me check with him and get back to you"
+- Do NOT bring up work unless they ask
+
+TONE:
+- Match their energy
+- Be warm and personable
+- Keep it SHORT — 1-2 sentences max
+- NEVER repeat the same response — vary your phrasing
+
+CRITICAL RULE: Your ONLY job is to respond to what they said. That's it. Stop there. Do not start new conversations.`
           },
-          ...history
+          ...recentHistory,
+          { role: 'user', content: `${contact.name} just said: "${text}"\n\nReply ONLY to this message. Don't ask new questions. Don't bring up work or projects. Just respond to what they said.` }
         ]
       });
 
-      const contactReply = contactResponse.choices[0].message.content.trim();
-      await saveMessage(chatId, 'assistant', contactReply);
+      const reply = response.choices[0].message.content.trim();
+      await saveMessage(chatId, 'assistant', reply);
 
-      if (contactReply.includes('tobidavid.dexcraft.agency')) await supabase.from('contacts').update({ portfolio_shared: true }).eq('chat_id', chatId);
-      if (contactReply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
+      if (reply.includes('tobidavid.dexcraft.agency')) await supabase.from('contacts').update({ portfolio_shared: true }).eq('chat_id', chatId);
+      if (reply.includes(process.env.CALENDLY_LINK)) await supabase.from('contacts').update({ calendly_shared: true }).eq('chat_id', chatId);
 
-      await sock.sendMessage(chatId, { text: contactReply });
-      console.log(`✅ Max replied to ${contact.name}`);
+      await sock.sendMessage(chatId, { text: reply });
+      console.log(`✅ Replied to ${contact.name}`);
 
-      const notifyJid = mainNumber.startsWith('234') ? `${mainNumber}@s.whatsapp.net` : `234${mainNumber.slice(1)}@s.whatsapp.net`;
-      try {
-        await sock.sendMessage(notifyJid, {
-          text: `🔔 *${contact.name || 'Someone'} said:* ${text}\n\n*Max replied:* ${contactReply}`
-        });
-      } catch (e) { console.error('Notify failed:', e.message); }
+      // Only notify if new contact or first message
+      if (!isEstablished) {
+        const mainJid = process.env.YOUR_MAIN_NUMBER.includes('@') ? process.env.YOUR_MAIN_NUMBER : `${process.env.YOUR_MAIN_NUMBER}@s.whatsapp.net`;
+        try {
+          await sock.sendMessage(mainJid, {
+            text: `🔔 NEW: ${contact.name}\n\n_"${text}"_\n\nMax: _"${reply}"_`
+          });
+        } catch (err) {
+          console.error('Notify error:', err.message);
+        }
+      }
     }
   });
 }
